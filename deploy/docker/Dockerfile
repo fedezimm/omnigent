@@ -48,6 +48,11 @@
 # Must satisfy pyproject requires-python (>=3.12); 3.11 fails dependency resolution.
 ARG PYTHON_VERSION=3.12
 ARG NODE_VERSION=20
+# Digests for the default PYTHON_VERSION / NODE_VERSION above, fetched
+# 2026-06-15.  When you bump a version ARG, update the matching digest
+# (run `docker pull <image> && docker inspect --format='{{index .RepoDigests 0}}' <image>`).
+ARG PYTHON_DIGEST=sha256:d764629ce0ddd8c71fd371e9901efb324a95789d2315a47db7e4d27e78f1b0e9
+ARG NODE_DIGEST=sha256:2cf067cfed83d5ea958367df9f966191a942351a2df77d6f0193e162b5febfc0
 
 # ── Web UI builder ──────────────────────────────────────
 # Builds the ap-web SPA so `docker build` works from a clean checkout —
@@ -59,7 +64,7 @@ ARG NODE_VERSION=20
 #
 # Behind a corporate npm proxy, pass it through:
 #   --build-arg NPM_CONFIG_REGISTRY=https://npm-proxy.example.com
-FROM node:${NODE_VERSION}-slim AS web-builder
+FROM node:${NODE_VERSION}-slim@${NODE_DIGEST} AS web-builder
 ARG NPM_CONFIG_REGISTRY=
 ENV NPM_CONFIG_REGISTRY=${NPM_CONFIG_REGISTRY}
 WORKDIR /web/ap-web
@@ -75,7 +80,7 @@ RUN npm run build
 # out of the shipped images. Deliberately SPA-free and psycopg-free so
 # the host target can build without node; the server-only additions
 # live in server-builder below.
-FROM python:${PYTHON_VERSION}-slim AS builder
+FROM python:${PYTHON_VERSION}-slim@${PYTHON_DIGEST} AS builder
 
 ARG PYPI_INDEX_URL=https://pypi.org/simple
 
@@ -140,7 +145,7 @@ RUN uv pip install --no-cache-dir --index-url ${PYPI_INDEX_URL} 'psycopg[binary]
 # ── Node alias stage ─────────────────────────────────────
 # Pure alias so the host stage can COPY node out of a version-pinned
 # image; contributes no layers of its own.
-FROM node:${NODE_VERSION}-slim AS node-runtime
+FROM node:${NODE_VERSION}-slim@${NODE_DIGEST} AS node-runtime
 
 # ── Host runtime (`--target host`) ──────────────────────
 # Prebaked Omnigent host for remote sandboxes: full omnigent install,
@@ -149,7 +154,7 @@ FROM node:${NODE_VERSION}-slim AS node-runtime
 # CLIs (claude / codex / pi) so claude-sdk, claude-native, codex, and
 # pi agents can run in managed sandboxes without an in-sandbox
 # install. No SPA, no psycopg, no server entrypoint.
-FROM python:${PYTHON_VERSION}-slim AS host
+FROM python:${PYTHON_VERSION}-slim@${PYTHON_DIGEST} AS host
 ARG NPM_CONFIG_REGISTRY=
 ENV NPM_CONFIG_REGISTRY=${NPM_CONFIG_REGISTRY}
 
@@ -223,7 +228,7 @@ WORKDIR /root
 CMD ["sleep", "infinity"]
 
 # ── Server runtime (default target) ─────────────────────
-FROM python:${PYTHON_VERSION}-slim AS runtime
+FROM python:${PYTHON_VERSION}-slim@${PYTHON_DIGEST} AS runtime
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
