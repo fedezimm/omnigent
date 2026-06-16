@@ -304,16 +304,16 @@ def test_mcp_tool_echo_roundtrip_journey(
 
     # ── Verify the echo tool was called ────────────────────
     tool_names = _tool_names_in_output(body)
-    assert "echo" in tool_names, (
-        f"Expected the ``echo`` MCP tool to be called, but only "
-        f"saw tool calls: {tool_names}. The MCP server may not "
-        f"have registered its tool with the harness."
-    )
+    # MCP tools are namespaced: "echo_mcp__echo" (server__tool).
+    echo_called = any("echo" in name for name in tool_names)
+    assert echo_called, f"Expected an ``echo`` MCP tool call, but only saw: {tool_names}."
+    # Find the actual tool name used (may be namespaced).
+    echo_tool_name = next(n for n in tool_names if "echo" in n)
 
     # ── Verify the probe string round-tripped ──────────────
     # Check tool output first (most deterministic), then fall
     # back to assistant text (the LLM may paraphrase around it).
-    echo_outputs = _get_function_call_outputs(http_client, session_id, "echo")
+    echo_outputs = _get_function_call_outputs(http_client, session_id, echo_tool_name)
     assistant_text = _extract_all_text(body)
     combined = " ".join(echo_outputs) + " " + assistant_text
 
