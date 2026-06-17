@@ -60,10 +60,3 @@
 
 # Python / UI SDKs
 /sdks/                       @dbczumar @fanzeyi @SabhyaC26 @TomeHirata
-
-# Tests
-/tests/                      @dbczumar @PattaraS @SabhyaC26 @TomeHirata
-
-# Docs & design
-/docs/                       @dhruv0811 @dbczumar @TomeHirata @shivam5
-/designs/                    @dbczumar @PattaraS @dhruv0811 @SabhyaC26
