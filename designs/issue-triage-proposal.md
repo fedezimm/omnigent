@@ -83,9 +83,33 @@ A maintainer only sees issues that the bot could not fully resolve. The escalati
 
 Maintainers work from a filtered view: `is:issue is:open label:P0-critical,P1-high,needs-triage -label:stale`. Everything else is either being handled by the bot/lifecycle or picked up by contributors.
 
-**Maintainer actions at this stage:**
-- Override bot labels if wrong
-- Assign to a team member or milestone
+#### Auto-assignment
+
+The bot assigns escalated issues to a maintainer automatically, based on two rules:
+
+1. **Route by domain first.** The `comp:*` label determines the domain team. Each component maps to a small group of domain experts:
+
+   | Component | Domain experts |
+   |---|---|
+   | `comp:core` | core runtime team |
+   | `comp:web-ui` | web/frontend team |
+   | `comp:sandbox` | core runtime team (sandbox specialists) |
+   | `comp:sdk` | SDK team |
+   | `comp:cli` | CLI owners |
+   | `comp:ci` | infra team |
+   | `comp:docs` | rotates across all teams |
+
+   *(Maintained as a config file — e.g. `.github/triage/domain-owners.yml` — not hardcoded in the workflow, so teams can update it without touching CI.)*
+
+2. **Round-robin within the domain group.** Among the eligible domain experts, assign to whoever has the fewest open assigned issues. This keeps load roughly balanced without ignoring expertise. If the domain group is empty or the component label is missing, fall back to the full maintainer list with the same least-loaded logic.
+
+**Why domain-first, not pure round-robin:** Pure equal distribution ignores context — a frontend maintainer assigned a sandbox bug wastes time ramping up and likely re-assigns anyway. Domain routing means the first human who looks at the issue can actually act on it. The load-balancing within the domain group prevents any single expert from becoming a bottleneck.
+
+**Override:** Maintainers can always reassign. The bot doesn't re-assign after initial routing — once a human touches it, the bot stays out.
+
+#### Maintainer actions at this stage
+- Override bot labels or assignment if wrong
+- Assign to a milestone
 - Add `mentor-available` to pair with a contributor
 - Apply `wontfix` and close with explanation
 - Invoke `/triage-issue` slash command to re-run bot classification
