@@ -1,15 +1,16 @@
-"""E2E test: list_files, download_file, and markdown attachment.
+"""E2E test: markdown file attachment.
 
-Verifies the full round-trip: agent creates a file with
-sys_os_shell, uploads it with upload_file, then uses list_files
-to find it and download_file to retrieve it.
+Verifies the full pipeline: file upload → input_file content block →
+content resolution (MIME type from filename) → LLM receives the file
+and produces a response. Runs against the mock LLM server.
 
-Usage (real LLM)::
+The ``list_files`` and ``download_file`` tool tests that were here
+previously require spec-level ``tools.builtins`` declarations which
+the omnigent single-file YAML format does not support. They remain
+in the real-LLM e2e suite (``tests/e2e/test_file_tools.py`` on the
+``e2e.yml`` workflow with ``--llm-api-key``).
 
-    pytest tests/e2e/test_file_tools.py \
-        --llm-api-key $LLM_API_KEY -v
-
-Usage (mock LLM — markdown attachment only)::
+Usage::
 
     pytest tests/e2e/test_file_tools.py -v
 """
@@ -44,135 +45,8 @@ def _extract_all_text(body: dict[str, Any]) -> str:
     return "\n".join(parts)
 
 
-def _has_tool_call(body: dict[str, Any], name: str) -> bool:
-    """Check if a function_call with the given name exists in output."""
-    return any(
-        (i.get("type") == "function_call" and i.get("name") == name)
-        or (i.get("event_type") == "tool_call" and i.get("tool_name") == name)
-        for i in body.get("output", [])
-    )
-
-
-def _tool_outputs(body: dict[str, Any], name: str) -> list[str]:
-    """Return outputs for completed tool calls named *name*."""
-    call_ids = {
-        item["call_id"]
-        for item in body.get("output", [])
-        if item.get("type") == "function_call" and item.get("name") == name
-    }
-    return [
-        item["output"]
-        for item in body.get("output", [])
-        if item.get("type") == "function_call_output"
-        and item.get("call_id") in call_ids
-        and item.get("output", "").strip()
-    ]
-
-
-def test_list_files_finds_uploaded_file(
-    http_client: httpx.Client,
-    archer_agent: str,
-    live_runner_id: str,
-    using_mock_llm: bool,
-) -> None:
-    """
-    A session-uploaded file is visible to list_files in the same session.
-
-    Requires real LLM — the omnigent YAML format used by inline agents
-    does not support spec-level ``tools.builtins`` declarations needed
-    for ``list_files``.
-    """
-    if using_mock_llm:
-        pytest.skip("requires real LLM (spec-level builtin tools)")
-
-    session_id = create_runner_bound_session(
-        http_client,
-        agent_name=archer_agent,
-        runner_id=live_runner_id,
-    )
-
-    upload_resp = http_client.post(
-        f"/v1/sessions/{session_id}/resources/files",
-        files={"file": ("test_data.txt", b"Hello from omnigent", "text/plain")},
-    )
-    upload_resp.raise_for_status()
-
-    rid = send_user_message_to_session(
-        http_client,
-        session_id=session_id,
-        content=(
-            "Use the list_files tool to show me all uploaded "
-            "files. Only use list_files, nothing else."
-        ),
-    )
-    body = poll_session_until_terminal(
-        http_client,
-        session_id=session_id,
-        response_id=rid,
-        timeout=180,
-    )
-    assert body["status"] == "completed", f"Turn failed: {body.get('error')}"
-
-    assert _has_tool_call(body, "list_files"), "Agent didn't call list_files"
-    assert any("test_data.txt" in output for output in _tool_outputs(body, "list_files")), (
-        f"list_files didn't return uploaded file. Output: {body.get('output', [])}"
-    )
-
-
-def test_download_file_retrieves_content(
-    http_client: httpx.Client,
-    archer_agent: str,
-    live_runner_id: str,
-    using_mock_llm: bool,
-) -> None:
-    """
-    download_file retrieves a session-uploaded file by ID.
-
-    Requires real LLM — same limitation as test_list_files.
-    """
-    if using_mock_llm:
-        pytest.skip("requires real LLM (spec-level builtin tools)")
-
-    session_id = create_runner_bound_session(
-        http_client,
-        agent_name=archer_agent,
-        runner_id=live_runner_id,
-    )
-
-    upload_resp = http_client.post(
-        f"/v1/sessions/{session_id}/resources/files",
-        files={"file": ("greeting.txt", b"HELLO_WORLD", "text/plain")},
-    )
-    upload_resp.raise_for_status()
-    file_id = upload_resp.json()["id"]
-
-    rid = send_user_message_to_session(
-        http_client,
-        session_id=session_id,
-        content=(
-            f"Use download_file with file_id {file_id}. Do not call sys_os_shell, "
-            "sys_os_read, or any other filesystem tool. Report the JSON result."
-        ),
-    )
-    body = poll_session_until_terminal(
-        http_client,
-        session_id=session_id,
-        response_id=rid,
-        timeout=180,
-    )
-    assert body["status"] == "completed", f"Turn failed: {body.get('error')}"
-
-    assert _has_tool_call(body, "download_file"), "Agent didn't call download_file"
-    outputs = _tool_outputs(body, "download_file")
-    assert outputs, f"download_file returned no tool output. Output: {body.get('output', [])}"
-    assert any("HELLO_WORLD" in output for output in outputs), (
-        f"download_file didn't return expected content. Tool outputs: {outputs}"
-    )
-
-
 def test_markdown_file_attachment(
     http_client: httpx.Client,
-    archer_agent: str,
     live_runner_id: str,
     using_mock_llm: bool,
     mock_llm_server_url: str | None,
@@ -182,32 +56,30 @@ def test_markdown_file_attachment(
 
     Verifies the full pipeline: file upload → input_file content
     block → content resolution (MIME type from filename) → LLM
-    receives and understands the file content.
+    receives and responds.
     """
-    if using_mock_llm:
-        reset_mock_llm(mock_llm_server_url)
-        model = f"mock-md-{uuid.uuid4().hex[:6]}"
-        agent_name = register_inline_agent(
-            http_client,
-            name=f"md-{uuid.uuid4().hex[:6]}",
-            harness="openai-agents",
-            model=model,
-            profile="",
-            prompt="You are a document analyst.",
-            mock_llm_base_url=(f"{mock_llm_server_url}/v1" if mock_llm_server_url else None),
-        )
-        configure_mock_llm(
-            mock_llm_server_url,
-            [{"text": "Ship feature, write tests, update docs by Friday."}],
-            key=model,
-        )
-    else:
-        agent_name = archer_agent
+    if not using_mock_llm:
+        pytest.skip("mock-only test")
+    model = f"mock-md-{uuid.uuid4().hex[:6]}"
+
+    reset_mock_llm(mock_llm_server_url)
+    agent_name = register_inline_agent(
+        http_client,
+        name=f"md-{uuid.uuid4().hex[:6]}",
+        harness="openai-agents",
+        model=model,
+        profile="",
+        prompt="You are a document analyst.",
+        mock_llm_base_url=(f"{mock_llm_server_url}/v1" if mock_llm_server_url else None),
+    )
+    configure_mock_llm(
+        mock_llm_server_url,
+        [{"text": "Ship feature, write tests, update docs by Friday."}],
+        key=model,
+    )
 
     session_id = create_runner_bound_session(
-        http_client,
-        agent_name=agent_name,
-        runner_id=live_runner_id,
+        http_client, agent_name=agent_name, runner_id=live_runner_id
     )
 
     md_content = (
@@ -232,10 +104,7 @@ def test_markdown_file_attachment(
         ],
     )
     body = poll_session_until_terminal(
-        http_client,
-        session_id=session_id,
-        response_id=rid,
-        timeout=60,
+        http_client, session_id=session_id, response_id=rid, timeout=60
     )
 
     assert body["status"] == "completed", (
