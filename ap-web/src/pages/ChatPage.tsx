@@ -3424,12 +3424,7 @@ export function Composer({
     // Cmd/Alt+↑/↓ (jump between messages) are global window hotkeys meant to
     // fire even mid-compose; without this guard the recall below intercepts
     // them (replacing the draft) and the hotkeys appear broken in the composer.
-    if (
-      (e.key === "ArrowUp" || e.key === "ArrowDown") &&
-      !e.metaKey &&
-      !e.ctrlKey &&
-      !e.altKey
-    ) {
+    if ((e.key === "ArrowUp" || e.key === "ArrowDown") && !e.metaKey && !e.ctrlKey && !e.altKey) {
       const ta = e.currentTarget;
       if (e.key === "ArrowUp" && ta.selectionStart === 0) {
         const recalled = recallPrevious(value);

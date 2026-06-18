@@ -69,9 +69,7 @@ describe("useApproveHotkey", () => {
   });
 
   it("skips AskUserQuestion (needs an explicit choice)", () => {
-    blocks = [
-      { type: "elicitation", elicitationId: "q1", status: "pending", askUserQuestion: {} },
-    ];
+    blocks = [{ type: "elicitation", elicitationId: "q1", status: "pending", askUserQuestion: {} }];
     renderHook(() => useApproveHotkey());
     press();
     expect(submitApproval).not.toHaveBeenCalled();
