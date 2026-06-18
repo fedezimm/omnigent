@@ -91,7 +91,7 @@ class PreparedCursorTerminal:
         session whose terminal had already exited, so a *fresh*
         ``cursor-agent`` TUI was launched with none of the prior turns.
         Cursor records no resumable chat id, so this is genuinely a new
-        chat — distinct from a brand-new session (``resolved_session_id
+        chat - distinct from a brand-new session (``resolved_session_id
         is None``) and from a live reattach. Drives the honest
         cold-resume stderr hint.
     """
@@ -317,7 +317,7 @@ async def _prepare_cursor_terminal_via_daemon(
     timeout = httpx.Timeout(30.0, read=120.0)
     async with httpx.AsyncClient(base_url=base_url, headers=headers, timeout=timeout) as client:
         # Resuming an existing session can either reattach to a live
-        # terminal (prior chat intact) or — if that terminal has exited —
+        # terminal (prior chat intact) or, if that terminal has exited,
         # cold-start a fresh TUI. We only know which after probing for a
         # running terminal below, so default both flags off here.
         reattached = False
@@ -360,7 +360,7 @@ async def _prepare_cursor_terminal_via_daemon(
                 )
             # Session exists but its terminal has exited. Cursor records no
             # resumable chat id, so the launch below starts a fresh TUI with
-            # no prior turns — flag it so the caller can say so honestly.
+            # no prior turns. Flag it so the caller can say so honestly.
             cold_resumed = True
             if persist_args:
                 _update_startup_progress(startup_progress, "Updating Cursor session...")

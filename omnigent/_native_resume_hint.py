@@ -77,7 +77,7 @@ def echo_native_cold_resume_hint(
     :returns: None.
     """
     click.echo(
-        f"Terminal not running — starting a fresh {agent_label} session "
+        f"Terminal not running - starting a fresh {agent_label} session "
         "(prior chat not restored).",
         err=True,
     )
