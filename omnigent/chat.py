@@ -2256,20 +2256,50 @@ async def _query_sessions_once(
 
     # Multi-turn loop for async orchestrators (e.g. polly) that dispatch
     # sub-agents and are auto-woken by inbox completions across multiple
-    # turns. Each iteration subscribes to the live stream and collects
-    # the next auto-triggered turn. The loop exits when the session
-    # becomes idle (no pending sub-agents) or the turn limit is hit.
+    # turns.
+    #
+    # Ordering: await_turn() opens the SSE subscription BEFORE we call
+    # refresh() to check status. This closes the race where a turn
+    # completes in the window between the status-check and the subscribe:
+    # because we're already subscribed, its CompletedEvent arrives on our
+    # open stream and is never missed. If the session was already idle
+    # when we subscribed, await_turn() returns empty after the per-turn
+    # timeout; the subsequent refresh() then shows "idle" and we exit.
+    #
+    # Timeouts: 120 s per turn (not 20 min) keeps a worst-case miss
+    # bounded. A global 1800 s wall-clock budget caps the entire loop
+    # regardless of turn count or individual delays.
     _MAX_EXTRA_TURNS = 30
-    for _ in range(_MAX_EXTRA_TURNS):
-        await chat.refresh()
-        if chat.status not in ("waiting", "running", "launching"):
-            break
-        extra = await chat.await_turn()
-        if extra.text:
-            all_text_parts.append(extra.text)
+    _PER_TURN_TIMEOUT_S = 120.0
+    _LOOP_TIMEOUT_S = 1800.0
+
+    async def _drain_extra_turns() -> None:
+        for iteration in range(_MAX_EXTRA_TURNS):
+            extra = await chat.await_turn(timeout=_PER_TURN_TIMEOUT_S)
+            await chat.refresh()
+            if extra.text:
+                all_text_parts.append(extra.text)
+            if chat.status not in ("waiting", "running", "launching"):
+                return
+        logger.warning(
+            "headless -p hit the %d-turn guard for session %s; "
+            "the orchestrator may still be running",
+            _MAX_EXTRA_TURNS,
+            bound.id,
+        )
+
+    try:
+        async with asyncio.timeout(_LOOP_TIMEOUT_S):
+            await _drain_extra_turns()
+    except asyncio.TimeoutError:
+        logger.warning(
+            "headless -p timed out after %.0fs waiting for session %s to complete",
+            _LOOP_TIMEOUT_S,
+            bound.id,
+        )
 
     if all_text_parts:
-        return "".join(all_text_parts)
+        return "\n\n".join(p for p in all_text_parts if p)
     # No assistant text at all. If the runner persisted a terminal
     # ``error`` item (e.g. a harness start failure like the cursor SDK's
     # invalid-model rejection), surface it instead of returning ``None`` —
