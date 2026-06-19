@@ -144,6 +144,7 @@ def _mock_polly_spec_dir(
     brain_model: str = _MOCK_BRAIN_MODEL,
     extra_executor_config: dict | None = None,
     polly_src: Path = _POLLY,
+    rewrite_sub_agent_harnesses: bool = False,
 ) -> Path:
     """
     Copy the polly bundle into *tmp_path* and rewrite it to use the mock LLM.
@@ -164,8 +165,32 @@ def _mock_polly_spec_dir(
         for the cost-advisor tests).
     :param polly_src: Source polly bundle directory; defaults to the
         shipped ``examples/polly``.
+    :param rewrite_sub_agent_harnesses: When ``True``, rewrite each
+        sub-agent's ``config.yaml`` to replace native CLI harnesses
+        (``pi``, ``pi-native``, ``claude-native``, ``codex-native``, etc.)
+        with ``openai-agents``.  Use this when a test only needs the child
+        *session row* to be created (e.g. to verify ``model_override``) and
+        doesn't need the native binary to actually run — avoids failures on
+        machines where the binary is absent from ``PATH``.
     :returns: Path to the copied polly bundle directory.
     """
+    # Native harnesses that require a CLI binary on PATH.  Replaced with
+    # ``openai-agents`` (SDK-based, no binary needed) when
+    # ``rewrite_sub_agent_harnesses`` is True.
+    _NATIVE_HARNESSES = frozenset(
+        {
+            "claude-native",
+            "native-claude",
+            "codex-native",
+            "native-codex",
+            "pi",
+            "pi-native",
+            "native-pi",
+            "cursor-native",
+            "native-cursor",
+        }
+    )
+
     dst = tmp_path / "polly"
     shutil.copytree(polly_src, dst, symlinks=False)
     config_path = dst / "config.yaml"
@@ -194,6 +219,25 @@ def _mock_polly_spec_dir(
         "api_key": "mock-key",
     }
     config_path.write_text(yaml.safe_dump(spec, sort_keys=False))
+
+    if rewrite_sub_agent_harnesses:
+        # Rewrite each sub-agent's config.yaml so native harnesses (which
+        # need a CLI binary on PATH) become ``openai-agents`` (SDK-based).
+        # This lets tests verify the child session row is created with the
+        # correct model_override without requiring the binary to be installed.
+        agents_dir = dst / "agents"
+        if agents_dir.is_dir():
+            for sub_config in agents_dir.glob("*/config.yaml"):
+                sub_spec = yaml.safe_load(sub_config.read_text())
+                sub_executor = sub_spec.get("executor") or {}
+                sub_cfg = sub_executor.get("config") or {}
+                harness = sub_cfg.get("harness") or sub_executor.get("type") or ""
+                if harness in _NATIVE_HARNESSES:
+                    sub_cfg["harness"] = "openai-agents"
+                    sub_executor["config"] = sub_cfg
+                    sub_spec["executor"] = sub_executor
+                    sub_config.write_text(yaml.safe_dump(sub_spec, sort_keys=False))
+
     return dst
 
 

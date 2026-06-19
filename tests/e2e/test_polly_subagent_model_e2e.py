@@ -422,7 +422,14 @@ def test_polly_lists_models_then_dispatches_pi_from_list(
     from tests.e2e.conftest import configure_mock_llm, reset_mock_llm
 
     reset_mock_llm(mock_llm_server_url)
-    polly_dir = _mock_polly_spec_dir(tmp_path, mock_llm_server_url)
+    # rewrite_sub_agent_harnesses=True replaces the native ``pi`` harness
+    # (which needs the ``pi`` binary on PATH) with ``openai-agents`` so the
+    # child session is created even when the binary is absent — e.g. on CI.
+    # The test only verifies that the child row exists with a non-null
+    # model_override; it does not need the pi process to actually run.
+    polly_dir = _mock_polly_spec_dir(
+        tmp_path, mock_llm_server_url, rewrite_sub_agent_harnesses=True
+    )
     tag = uuid.uuid4().hex[:8]
     # Pick a concrete Claude model for pi — one that the family guard will accept
     # (it only needs to be a Claude-family id, not one from any real catalog).

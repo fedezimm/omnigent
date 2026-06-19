@@ -381,12 +381,13 @@ def test_optimize_mode_runs_turn_on_verdict_model(
     tmp_path: Path,
     mock_llm_server_url: str,
 ) -> None:
-    """Optimize mode: the verdict is persisted with ``applied=True``, and a
+    """Optimize mode: the verdict is persisted with ``applied=False``, and a
     conversational follow-up persists NO new label.
 
     The strongest observable available without a real model: the persisted
-    verdict's ``applied=True`` proves the runner applied the override in the
-    harness request, and the follow-up's absent label proves the judge's
+    verdict's ``applied=False`` (the openai-agents harness is outside the
+    advisor's ``claude-sdk``-only scope, so it records but does not apply),
+    and the follow-up's absent label proves the judge's
     ``null`` verdict for small talk is respected.
 
     The mock judge is loaded with an ``expensive`` verdict for the hard
@@ -430,7 +431,6 @@ def test_optimize_mode_runs_turn_on_verdict_model(
     assert verdict["applied"] is False, (
         f"optimize mode with openai-agents harness must be shadow-only; got verdict={verdict}"
     )
-    expensive_model = verdict["model"]
 
     # ── Conversational follow-up → null verdict → no new label ────────────
     # The judge returns {"tier": null} for small talk; the advisor skips the
@@ -466,7 +466,7 @@ def test_optimize_mode_runs_turn_on_verdict_model(
     # ...and the prior session's verdict is untouched.
     after = _verdict_label(local_polly_server, conv_id)
     assert after is not None
-    assert after["model"] == expensive_model, (
+    assert after["model"] == verdict["model"], (
         "the follow-up run overwrote the prior session's verdict label"
     )
 
