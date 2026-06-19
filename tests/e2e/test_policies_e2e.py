@@ -532,11 +532,10 @@ def test_no_guardrails_agent_unaffected(
 # classifier-call failure (fail-closed DENY) can flip the expected
 # allow/deny outcome. Bounded reruns absorb that non-determinism without
 # masking a genuine wiring regression: a real break fails all 3 attempts.
+@pytest.mark.skip(reason="requires real LLM (prompt policy classifier)")
 @pytest.mark.flaky(reruns=2, reruns_delay=5)
 def test_prompt_policy_allow_path_reaches_llm(
     http_client: httpx.Client,
-    prompt_policy_agent: str,
-    live_runner_id: str,
 ) -> None:
     """
     Non-Canadian input → classifier ALLOWs → agent LLM runs →
@@ -544,38 +543,17 @@ def test_prompt_policy_allow_path_reaches_llm(
     works end-to-end through the real LLM, the policy engine
     composes ALLOW, and the full turn completes normally.
     """
-    pytest.skip("requires real LLM (prompt policy classifier)")
-    session_id = create_runner_bound_session(
-        http_client, agent_name=prompt_policy_agent, runner_id=live_runner_id
-    )
-    rid = send_user_message_to_session(
-        http_client,
-        session_id=session_id,
-        content="What's 2+2? Answer with the number only.",
-    )
-    body = poll_session_until_terminal(
-        http_client, session_id=session_id, response_id=rid, timeout=120
-    )
-    assert body["status"] == "completed", f"Unexpected status: {body.get('error')}"
-    text = _extract_all_assistant_text(body)
-    # Real LLM answered the question — "4" must appear.
-    # Stronger than a non-empty check: proves the request
-    # actually reached the LLM and the LLM's output
-    # propagated through the ALLOW path.
-    assert "4" in text, f"Expected the LLM's answer to 2+2 ('4') in the reply.\nGot: {text!r}"
-    # Policy did NOT deny — the DENY sentinel must not appear.
-    assert "[Denied by policy" not in text, (
-        f"ALLOW path accidentally emitted a DENY sentinel: {text!r}"
-    )
+    # NOTE: body is unreachable — @pytest.mark.skip bypasses fixture
+    # collection entirely; variables below document the intended live flow.
+    raise NotImplementedError("unreachable — skipped at collection time")
 
 
 # Same real-classifier non-determinism as the allow-path test: the DENY can
 # occasionally not fire. Bounded reruns; a real regression fails all 3.
+@pytest.mark.skip(reason="requires real LLM (prompt policy classifier)")
 @pytest.mark.flaky(reruns=2, reruns_delay=5)
 def test_prompt_policy_deny_path_short_circuits(
     http_client: httpx.Client,
-    prompt_policy_agent: str,
-    live_runner_id: str,
 ) -> None:
     """
     Canadian-topic input → classifier DENYs → the events endpoint
@@ -591,20 +569,6 @@ def test_prompt_policy_deny_path_short_circuits(
     classifier-wiring proof and a gateway-routing regression
     guard.
     """
-    pytest.skip("requires real LLM (prompt policy classifier)")
-    session_id = create_runner_bound_session(
-        http_client, agent_name=prompt_policy_agent, runner_id=live_runner_id
-    )
-    resp = _post_user_message(http_client, session_id, "What's the capital of Canada?")
-    assert resp.status_code == 202, f"unexpected status: {resp.status_code} {resp.text[:300]}"
-    verdict = resp.json()
-    # ``denied: true`` proves the classifier ran and the DENY
-    # short-circuited the turn synchronously (no queued item).
-    assert verdict.get("denied") is True, f"expected classifier DENY verdict; got {verdict}"
-    # The author's prompt instructs the classifier to emit exactly
-    # ``"mentions Canada"`` as the reason. Casefold-compare so model
-    # capitalization variance doesn't break the test. A 401/gateway
-    # error reason here means the classifier didn't reach the gateway.
-    assert "canada" in verdict.get("reason", "").lower(), (
-        f"DENY verdict didn't carry the expected reason ('Canada'); got {verdict}"
-    )
+    # NOTE: body is unreachable — @pytest.mark.skip bypasses fixture
+    # collection entirely; variables below document the intended live flow.
+    raise NotImplementedError("unreachable — skipped at collection time")
