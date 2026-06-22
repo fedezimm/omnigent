@@ -17,8 +17,6 @@ their own policy callables via pip-installed packages.
 
 from __future__ import annotations
 
-from typing import Any
-
 from omnigent.policies.schema import PolicyEvent, PolicyResponse
 from omnigent.policies.types import PolicyResult
 from omnigent.spec.types import PolicyAction
@@ -29,7 +27,7 @@ from omnigent.spec.types import PolicyAction
 _SENTINEL = "BLOCK_THIS_TOKEN"
 
 
-def _allow() -> dict[str, Any]:
+def _allow() -> PolicyResponse:
     """Return a fresh ALLOW decision for test policy callables."""
     return {"result": "ALLOW"}
 
