@@ -7575,19 +7575,30 @@ async def _forward_event_to_runner(
             _resolve_message_content,
         )
 
-        try:
-            forwarded_data["content"] = _resolve_message_content(
-                forwarded_data["content"],
-                file_store,
-                artifact_store,
-                session_id=session_id,
-            )
-        except (ValueError, KeyError):
-            _logger.warning(
-                "File reference resolution failed for session=%s",
-                session_id,
-                exc_info=True,
-            )
+        _unresolved = [
+            b for b in forwarded_data["content"] if isinstance(b, dict) and "file_id" in b
+        ]
+        if _unresolved:
+            try:
+                forwarded_data["content"] = _resolve_message_content(
+                    forwarded_data["content"],
+                    file_store,
+                    artifact_store,
+                    session_id=session_id,
+                )
+                _logger.debug(
+                    "Resolved %d file_id block(s) for session=%s before forwarding",
+                    len(_unresolved),
+                    session_id,
+                )
+            except (ValueError, KeyError):
+                _logger.warning(
+                    "File reference resolution failed for session=%s "
+                    "(unresolved file_id blocks will reach the runner unresolved — "
+                    "runner will attempt fallback resolution)",
+                    session_id,
+                    exc_info=True,
+                )
 
     # Flatten SessionEventInput {type, data} into the runner's
     # discriminated-union shape {type, ...data_fields}. The runner's
@@ -9024,7 +9035,7 @@ async def _register_policy_elicitation(
         message=result.reason or "Approval required",
         requested_schema={},
         phase=Phase.TOOL_CALL.value,
-        policy_name=result.deciding_policy or "unknown",
+        policy_names=result.deciding_policies or ["unknown"],
         content_preview=arguments_preview[:1024],
     )
     # Approval state lives on the runner (in-memory
@@ -10613,6 +10624,8 @@ async def _create_session_from_existing_agent(
     user_id: str | None = None,
     permission_store: PermissionStore | None = None,
     liveness_lookup: Callable[[list[str]], dict[str, SessionLiveness]] | None = None,
+    file_store: FileStore | None = None,
+    artifact_store: ArtifactStore | None = None,
 ) -> SessionResponse:
     """
     Create a session bound to an already-registered agent.
@@ -10638,6 +10651,10 @@ async def _create_session_from_existing_agent(
         ``parent_session_id`` and session-scoped ``agent_id``.
     :param liveness_lookup: Optional session-scoped liveness lookup
         to populate ``SessionResponse.runner_online``.
+    :param file_store: Optional file metadata store for resolving
+        ``file_id`` references in ``initial_items`` before forwarding
+        to the runner.
+    :param artifact_store: Optional binary content store for the same.
     :returns: The newly created session snapshot.
     :raises OmnigentError: 404 if no agent matches ``body.agent_id``;
         403/404 if ``parent_session_id`` or session-scoped ``agent_id``
@@ -10910,6 +10927,8 @@ async def _create_session_from_existing_agent(
                     conversation_store,
                     runner_client,
                     agent_name=agent.name,
+                    file_store=file_store,
+                    artifact_store=artifact_store,
                     created_by=_attribution_user(user_id),
                 )
     # Re-read rather than reusing the local ``conv``: the label-only branch
@@ -12214,6 +12233,8 @@ def create_sessions_router(
             user_id=user_id,
             permission_store=permission_store,
             liveness_lookup=liveness_lookup,
+            file_store=file_store,
+            artifact_store=artifact_store,
         )
         # Notify the runner about the new session so it can resolve
         # the spec and cache sub_agent_name before the first turn.
@@ -18204,30 +18225,31 @@ async def _get_session_snapshot(
     if runner_client is None:
         runner_client = get_runner_client()
 
-    status = _session_status_cache.get(session_id)
-    if status is None:
-        # Cache miss: either the server restarted, or the relay
-        # has not yet published the first ``"running"`` event
-        # for a freshly bound session (the relay's GET /stream
-        # is still in its tunnel handshake). Ask the runner for
-        # live status so we don't synthesize a stale ``"idle"``
-        # while a turn is actually in flight.
-        if runner_client is not None:
+    status = _session_status_from_cache(session_id)
+    if status == "idle":
+        # Cache miss (or truly idle): either the server restarted, or the
+        # relay has not yet published the first ``"running"`` event for a
+        # freshly bound session (the relay's GET /stream is still in its
+        # tunnel handshake). Ask the runner for live status so we don't
+        # synthesize a stale ``"idle"`` while a turn is actually in flight.
+        # ``_session_status_from_cache`` already collapses the fine-grained
+        # relay values (``"waiting"`` → ``"running"``), so the raw cache value
+        # is only needed here when it is actually missing (None).
+        if _session_status_cache.get(session_id) is None and runner_client is not None:
             try:
                 resp = await runner_client.get(
                     f"/v1/sessions/{session_id}",
                     timeout=5.0,
                 )
                 if resp.status_code == 200:
-                    status = resp.json().get("status", "idle")
-                    _session_status_cache[session_id] = status
+                    raw = resp.json().get("status", "idle")
+                    _session_status_cache[session_id] = raw
+                    status = _session_status_from_cache(session_id)
             except httpx.HTTPError:
                 _logger.debug(
                     "Runner status query failed for %s",
                     session_id,
                 )
-        if status is None:
-            status = "idle"
     # last_total_tokens and last_task_error come from the context-tokens
     # label written by the forwarder (tasks table has been removed).
     last_total_tokens: int | None = None
