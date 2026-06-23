@@ -40,6 +40,9 @@ from tests.e2e_ui.messages.test_native_claude_render_parity import (
 
 _log = logging.getLogger(__name__)
 
+# Drives a real Claude Code CLI against the live gateway -- gateway-only.
+pytestmark = pytest.mark.native_gateway
+
 _APPROVAL_CARD = '[data-testid="approval-card"]'
 _FORM = '[data-testid="ask-user-question-form"]'
 _SUBMIT = '[data-testid="ask-user-question-submit"]'

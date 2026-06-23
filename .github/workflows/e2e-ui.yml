@@ -1,14 +1,32 @@
 name: E2E UI Tests
 
-# Runs the Playwright UI suite against a freshly built ap-web SPA + a
-# hello_world test agent, split across a 3-shard matrix. Separate from
-# nightly.yml because the Node + Playwright + SPA-build setup is disjoint
-# from the inner-only legs.
+# Runs the Playwright UI suite against a freshly built ap-web SPA. The suite is
+# split into two jobs by where the LLM lives:
+#
+#   e2e-ui ("E2E UI Tests")  -- the mock-LLM majority. The openai-agents
+#       hello_world harness talks to the in-process mock LLM (the conftest's
+#       live_server fixture points OPENAI_BASE_URL at it), so this job needs NO
+#       secrets and runs on ALL PRs, same-repo AND fork, just like ci.yml. Runs
+#       `-m "not native_gateway"`.
+#
+#   e2e-ui-native ("E2E UI Native")  -- the native render-parity / approval
+#       tests that drive a REAL Claude Code / Codex / Cursor CLI against the live
+#       Databricks gateway (LLM_API_KEY / GATEWAY_BASE_URL). Secret-bearing, so
+#       fork PRs skip it here and run it via the fork-e2e/** mirror push after a
+#       maintainer approves (same model as before the split). Runs
+#       `-m native_gateway`.
+#
+# Both jobs share their setup and failure-artifact steps via the e2e-ui-setup /
+# e2e-ui-artifacts composite actions so the two never drift. Shard check names
+# for both live in merge-ready/required.sh -- keep them in sync with the
+# NUM_SHARDS values below.
 #
 # Triggers:
-#   pull_request        SAME-REPO PRs only; draft / fork PRs skip the job
-#                       (forks run via the fork-e2e/** push after approval).
-#   push (fork-e2e/**)  UI suite for mirrored fork PRs (trusted, secrets flow).
+#   pull_request        Mock job: ALL PRs (same-repo + fork). Native job:
+#                       same-repo only; fork PRs skip and run via the mirror.
+#                       Draft PRs skip both.
+#   push (fork-e2e/**)  Mirrored fork PRs -- runs BOTH jobs (trusted, secrets
+#                       flow); this is how a fork's native suite executes.
 #   schedule            09:00 UTC daily, alongside nightly.yml.
 #   workflow_dispatch   manual run. Input `branch` selects a non-main ref.
 
@@ -65,16 +83,19 @@ jobs:
   gate:
     uses: ./.github/workflows/security-gate.yml
 
-  # Compute the shard matrix once. A skipped run (draft / fork pull_request)
-  # yields an EMPTY matrix -> zero shard jobs -> no skipped placeholder check.
-  # Shared with e2e.yml via e2e-shard-matrix.sh (only NUM_SHARDS differs).
+  # Compute both shard matrices once. A skipped leg yields an EMPTY matrix ->
+  # zero shard jobs -> no skipped placeholder check. The mock leg sets
+  # ALLOW_FORK_PR=true so fork PRs run it directly (no secrets); the native leg
+  # omits it, so fork PRs skip and run via the fork-e2e/** mirror. Shared with
+  # e2e.yml via e2e-shard-matrix.sh.
   setup:
     name: setup
     needs: gate
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
-      matrix: ${{ steps.matrix.outputs.matrix }}
+      mock: ${{ steps.mock.outputs.matrix }}
+      native: ${{ steps.native.outputs.matrix }}
     steps:
       - name: Check out CI scripts
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
@@ -83,19 +104,32 @@ jobs:
           # only shards tests -- no secrets exposure, so the PR's copy is fine.
           sparse-checkout: .github/scripts/ci
           persist-credentials: false
-      - name: Compute shard matrix
-        id: matrix
+      - name: Compute mock shard matrix
+        id: mock
         env:
           EVENT_NAME: ${{ github.event_name }}
           IS_DRAFT: ${{ github.event.pull_request.draft }}
           IS_FORK: ${{ github.event.pull_request.head.repo.fork }}
+          # Mock-LLM only, no secrets, so fork PRs run directly (like CI).
+          ALLOW_FORK_PR: "true"
           NUM_SHARDS: "3"
         run: bash .github/scripts/ci/e2e-shard-matrix.sh
+      - name: Compute native shard matrix
+        id: native
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          IS_DRAFT: ${{ github.event.pull_request.draft }}
+          IS_FORK: ${{ github.event.pull_request.head.repo.fork }}
+          # No ALLOW_FORK_PR: native tests need the gateway secret, so fork PRs
+          # skip here and run via the fork-e2e/** mirror push after approval.
+          NUM_SHARDS: "2"
+        run: bash .github/scripts/ci/e2e-shard-matrix.sh
 
+  # Mock-LLM UI suite (the majority). No secrets; runs on all PRs incl. forks.
   e2e-ui:
     name: E2E UI Tests (shard ${{ matrix.shard_id }}/${{ matrix.num_shards }})
-    # Draft / fork pull_request events resolve to an EMPTY matrix in `setup`
-    # (forks run via the fork-e2e/** mirror push), so no shard runs for them.
+    # Draft PRs resolve to an EMPTY matrix in `setup`, so no shard runs for
+    # them. Fork PRs DO run (mock LLM, no secrets) -- same as ci.yml.
     # `ready_for_review` re-fires when a draft is converted.
     needs: setup
     runs-on: ubuntu-latest
@@ -104,9 +138,7 @@ jobs:
       # One red shard shouldn't cancel siblings -- we want every shard's signal.
       fail-fast: false
       max-parallel: 3
-      # Shards from `setup`; [] when skipped. Shard check names live in
-      # merge-ready/required.sh -- keep in sync with NUM_SHARDS above.
-      matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
+      matrix: ${{ fromJSON(needs.setup.outputs.mock) }}
 
     steps:
       - name: Checkout
@@ -114,69 +146,80 @@ jobs:
         with:
           ref: ${{ github.event.inputs.branch || github.ref }}
 
-      - name: Set up Python
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
-        with:
-          python-version-file: ".python-version"
+      - name: Set up e2e-ui environment
+        uses: ./.github/actions/e2e-ui-setup
 
-      - name: Set up Node 20
-        uses: ./.github/actions/setup-node
+      - name: Run UI e2e tests (mock LLM)
+        # --ui-skip-build: the SPA was built in the setup composite.
+        # --tracing/--screenshot/--video default to off; retain-on-failure
+        # keeps green runs cheap while capturing artifacts on failures.
+        # OPENAI_API_KEY / OPENAI_BASE_URL are set by the conftest's
+        # live_server fixture to point at the in-process mock LLM server —
+        # no real gateway credentials needed for the openai-agents harness.
+        env:
+          # Scheduled / manually dispatched runs are the full pass;
+          # PR and push runs exclude @pytest.mark.nightly tests.
+          NIGHTLY_FULL: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+          SHARD_ID: ${{ matrix.shard_id }}
+          NUM_SHARDS: ${{ matrix.num_shards }}
+        run: |
+          # Exclude @native_gateway (those run in the e2e-ui-native job with the
+          # gateway secret) and @visual (its own pinned-runner gate,
+          # ui-snapshot.yml -- it would flake on font drift here). Add the
+          # nightly exclusion for PR/push runs.
+          MARKER="not native_gateway and not visual"
+          if [[ "$NIGHTLY_FULL" != "true" ]]; then
+            MARKER="$MARKER and not nightly"
+          fi
+          # --splits/--group partition the suite via a strided slice (see
+          # pytest_collection_modifyitems in tests/e2e_ui/conftest.py), which
+          # evens out wall-clock better than pytest-shard's hash-bucketing.
+          # --group is 1-indexed, so map the 0-indexed shard_id with +1.
+          uv run pytest tests/e2e_ui \
+            -v --tb=long --showlocals --log-level=INFO -r a \
+            --ui-skip-build \
+            --splits="$NUM_SHARDS" \
+            --group="$((SHARD_ID + 1))" \
+            --tracing=retain-on-failure \
+            --screenshot=only-on-failure \
+            --video=retain-on-failure \
+            -m "$MARKER" \
+            || { rc=$?; [ "$rc" -eq 5 ] && echo "::notice::No tests collected in this shard; treating as a pass." || exit "$rc"; }
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a  # v4
+      - name: Capture failure artifacts
+        if: failure()
+        uses: ./.github/actions/e2e-ui-artifacts
         with:
-          enable-cache: true
+          shard_id: ${{ matrix.shard_id }}
 
-      - name: Cache virtualenv
-        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684  # v4
+  # Native render-parity / approval suite. Secret-bearing (real gateway), so
+  # fork PRs skip here (empty matrix) and run via the fork-e2e/** mirror push.
+  e2e-ui-native:
+    name: E2E UI Native (shard ${{ matrix.shard_id }}/${{ matrix.num_shards }})
+    needs: setup
+    runs-on: ubuntu-latest
+    # Native turns are full agent loops against the real gateway (per-test
+    # timeout up to 900s), so allow more wall-clock than the mock job.
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix: ${{ fromJSON(needs.setup.outputs.native) }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
-          path: .venv
-          key: venv-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}
+          ref: ${{ github.event.inputs.branch || github.ref }}
+
+      - name: Set up e2e-ui environment
+        uses: ./.github/actions/e2e-ui-setup
+
       - name: Set LLM credentials
         run: echo "LLM_API_KEY=${{ secrets.LLM_API_KEY }}" >> "$GITHUB_ENV"
 
-      - name: Install project + dev extras
-        run: uv sync --extra all --extra dev
-
-      - name: Install bubblewrap + tmux
-        # bubblewrap: the UI tests open terminals under os_env, whose
-        # linux_bwrap backend fails loud if `bwrap` is missing. The apparmor
-        # sysctl mirrors ci.yml (Ubuntu 24.04 blocks unprivileged user
-        # namespaces, which bwrap's unshare(CLONE_NEWUSER) needs).
-        # tmux: the claude-native render-parity test drives Claude Code
-        # through a tmux pane, so `tmux` must be on PATH.
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y bubblewrap tmux
-          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-
-      - name: Cache Playwright browsers
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
-        with:
-          path: ~/.cache/ms-playwright
-          key: ${{ runner.os }}-playwright-${{ hashFiles('uv.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-playwright-
-
-      - name: Install Playwright Chromium
-        run: |
-          uv run playwright install --with-deps chromium
-
-      - name: Build ap-web SPA
-        # Build BEFORE pytest: Vite's emptyOutDir clobbers the static dir,
-        # so never run it under xdist or alongside the live server.
-        # --legacy-peer-deps avoids re-resolving the known React 19 peer
-        # conflict under @emoji-mart/react.
-        env:
-          NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
-        run: |
-          cd ap-web
-          npm ci --legacy-peer-deps --no-audit --no-fund
-          npm run build
-
       # Native coding-agent harness enablement: the next steps let the
-      # native render-parity tests boot a real Claude Code / Codex CLI. The
-      # rest of the e2e-ui suite (openai-agents) ignores them.
+      # native render-parity tests boot a real Claude Code / Codex CLI.
       - name: Install Claude Code CLI
         # claude-code 2.1.170, NOT the 2.1.124 in .github/ci-deps: 2.1.124
         # doesn't recognise the hook events the native bridge configures and
@@ -254,34 +297,20 @@ jobs:
                   default: databricks-gpt-5-4-mini
           EOF
 
-      - name: Run UI e2e tests
-        # --ui-skip-build: the SPA was built in the previous step.
-        # --tracing/--screenshot/--video default to off; retain-on-failure
-        # keeps green runs cheap while capturing artifacts on failures.
-        # OPENAI_API_KEY / OPENAI_BASE_URL are set by the conftest's
-        # live_server fixture to point at the in-process mock LLM server —
-        # no real gateway credentials needed for the openai-agents harness.
-        # Native render-parity tests (claude-sdk/codex) still use the
-        # ~/.omnigent/config.yaml written in the step above.
+      - name: Run UI e2e tests (native gateway)
+        # Native render-parity / approval tests drive a real Claude Code / Codex
+        # / Cursor CLI via the ~/.omnigent/config.yaml written above.
         env:
-          # Scheduled / manually dispatched runs are the full pass;
-          # PR and push runs exclude @pytest.mark.nightly tests.
           NIGHTLY_FULL: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
           SHARD_ID: ${{ matrix.shard_id }}
           NUM_SHARDS: ${{ matrix.num_shards }}
         run: |
-          # Always exclude @visual: the UI diff snapshot runs in its own
-          # pinned-runner gate (ui-snapshot.yml) so its baseline matches the
-          # comparison environment; on this unpinned ubuntu-latest it would
-          # flake on font drift. Add the nightly exclusion for PR/push runs.
-          MARKER="not visual"
+          # Only @native_gateway tests here; still exclude @visual (its own gate)
+          # and @nightly on PR/push runs.
+          MARKER="native_gateway and not visual"
           if [[ "$NIGHTLY_FULL" != "true" ]]; then
             MARKER="$MARKER and not nightly"
           fi
-          # --splits/--group partition the suite via a strided slice (see
-          # pytest_collection_modifyitems in tests/e2e_ui/conftest.py), which
-          # evens out wall-clock better than pytest-shard's hash-bucketing.
-          # --group is 1-indexed, so map the 0-indexed shard_id with +1.
           uv run pytest tests/e2e_ui \
             -v --tb=long --showlocals --log-level=INFO -r a \
             --ui-skip-build \
@@ -293,93 +322,25 @@ jobs:
             -m "$MARKER" \
             || { rc=$?; [ "$rc" -eq 5 ] && echo "::notice::No tests collected in this shard; treating as a pass." || exit "$rc"; }
 
-      - name: Upload Playwright traces / videos / screenshots on failure
-        id: upload_playwright
+      - name: Capture failure artifacts
         if: failure()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        uses: ./.github/actions/e2e-ui-artifacts
         with:
-          # Shard suffix avoids the matrix's parallel uploads colliding (v4
-          # 409s on dupe names).
-          name: e2e-ui-playwright-${{ github.run_id }}-shard${{ matrix.shard_id }}
-          # `playwright-report/` is the JS-runner's HTML dir, never produced
-          # by pytest-playwright -- kept for forward-compat (ignore-if-absent).
-          path: |
-            test-results/
-            playwright-report/
-          retention-days: 3
-          if-no-files-found: ignore
-
-      - name: Dump Claude transcript on failure
-        # Claude Code's transcript JSONL lives under ~/.claude/projects (a
-        # hidden dir the artifact glob misses); stage it under /tmp. NOT
-        # copying ~/.claude.json: its apiKeyHelper embeds the gateway token.
-        if: failure()
-        run: |
-          mkdir -p /tmp/claude-home-dump
-          cp -r "$HOME/.claude/projects" /tmp/claude-home-dump/ 2>/dev/null || true
-
-      - name: Dump Codex transcript on failure
-        # Codex's per-session rollout JSONLs live under the bridged CODEX_HOME
-        # at ~/.omnigent/codex-native/<hash>/codex-home/sessions; stage only
-        # the *.jsonl. NOT copying config.toml: its auth command embeds the token.
-        if: failure()
-        run: |
-          mkdir -p /tmp/codex-home-dump
-          find "$HOME/.omnigent/codex-native" -name '*.jsonl' -print0 2>/dev/null \
-            | xargs -0 -I{} cp --parents {} /tmp/codex-home-dump/ 2>/dev/null || true
-
-      - name: Upload server logs on failure
-        id: upload_server_logs
-        if: failure()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
-        with:
-          name: e2e-ui-server-logs-${{ github.run_id }}-shard${{ matrix.shard_id }}
-          # server.log + runner.log from the live_server fixture's tmp dir,
-          # plus the native bridge dirs and the Claude / Codex transcripts
-          # staged above -- all needed to triage a native render-parity failure.
-          path: |
-            /tmp/pytest-of-runner/**/e2e_ui_server*/server.log
-            /tmp/pytest-of-runner/**/e2e_ui_server*/runner.log
-            /tmp/omnigent-*/claude-native/**
-            /tmp/claude-home-dump/**
-            /tmp/codex-home-dump/**
-          retention-days: 3
-          if-no-files-found: ignore
-
-      - name: Surface failure artifacts on job summary
-        # Write a flat, always-visible block of artifact download links to
-        # GITHUB_STEP_SUMMARY (GH otherwise buries them inside each step).
-        if: failure()
-        env:
-          PLAYWRIGHT_URL: ${{ steps.upload_playwright.outputs.artifact-url }}
-          SERVER_LOGS_URL: ${{ steps.upload_server_logs.outputs.artifact-url }}
-        run: |
-          {
-            echo "## Failure artifacts"
-            echo
-            echo "Direct downloads (retention 3 days):"
-            echo
-            if [ -n "${PLAYWRIGHT_URL}" ]; then
-              echo "- 🎬 [Playwright trace / video / screenshots](${PLAYWRIGHT_URL})"
-            else
-              echo "- 🎬 Playwright trace: _no artifact uploaded (test-results/ was empty)_"
-            fi
-            if [ -n "${SERVER_LOGS_URL}" ]; then
-              echo "- 📜 [omnigent server log](${SERVER_LOGS_URL})"
-            else
-              echo "- 📜 server.log: _no artifact uploaded (glob matched nothing)_"
-            fi
-          } >> "$GITHUB_STEP_SUMMARY"
+          shard_id: ${{ matrix.shard_id }}
 
   # Explicitly re-dispatch Merge Ready (same-repo PR or fork-e2e push): the
-  # workflow_run hop is brittle and was dropped on #751/#792. No checkout,
-  # actions:write only; GITHUB_TOKEN workflow_dispatch is exempt from recursion.
+  # workflow_run hop is brittle and was dropped on #751/#792. Fork pull_request
+  # runs (mock job only) are NOT re-dispatched here -- their token is read-only,
+  # so they re-evaluate via merge-ready.yml's own workflow_run trigger; the
+  # fork-e2e mirror push (which runs the native job) re-dispatches from its
+  # trusted token. No checkout, actions:write only; GITHUB_TOKEN
+  # workflow_dispatch is exempt from recursion.
   merge-ready-rerun:
     name: Merge Ready rerun
-    needs: e2e-ui
+    needs: [e2e-ui, e2e-ui-native]
     if: >-
       always()
-      && needs.e2e-ui.result != 'skipped'
+      && (needs.e2e-ui.result != 'skipped' || needs.e2e-ui-native.result != 'skipped')
       && (
         (github.event_name == 'pull_request'
           && github.event.pull_request.head.repo.full_name == github.repository)

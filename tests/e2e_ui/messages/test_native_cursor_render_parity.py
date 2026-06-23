@@ -112,10 +112,15 @@ def _cursor_unavailable_reason() -> str | None:
     return None
 
 
-pytestmark = pytest.mark.skipif(
-    _cursor_unavailable_reason() is not None,
-    reason=_cursor_unavailable_reason() or "",
-)
+# native_gateway: drives a real Cursor CLI against the live gateway. The skipif
+# additionally drops it when the Cursor CLI / CURSOR_API_KEY is unavailable.
+pytestmark = [
+    pytest.mark.native_gateway,
+    pytest.mark.skipif(
+        _cursor_unavailable_reason() is not None,
+        reason=_cursor_unavailable_reason() or "",
+    ),
+]
 
 
 def _open_terminal_view(page: Page) -> None:
