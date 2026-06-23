@@ -818,6 +818,31 @@ async def _auto_create_opencode_terminal(
     clear_bridge_state(bridge_dir)
 
     model_override = launch_config.model_override or _opencode_native_model_from_spec(agent_spec)
+    # Route opencode through the Databricks AI gateway when the spec names a
+    # profile. Unlike codex/claude/pi (which consume HARNESS_*_GATEWAY_* env the
+    # CLI translates), opencode reads provider/auth from its own config file, so
+    # synthesize an opencode.json into the per-session XDG config dir BEFORE the
+    # server boots. Best-effort: if the gateway can't be resolved (no profile,
+    # databricks-sdk absent, auth failure), opencode falls back to whatever
+    # provider config the ambient env/global config already gives it.
+    from omnigent.opencode_native_bridge import xdg_config_home_for_bridge_dir
+    from omnigent.opencode_native_provider import (
+        build_opencode_provider_config,
+        resolve_databricks_gateway,
+        write_opencode_provider_config,
+    )
+
+    gateway = resolve_databricks_gateway(
+        _opencode_native_profile_from_spec(agent_spec), model_id=model_override
+    )
+    if gateway is not None:
+        write_opencode_provider_config(
+            xdg_config_home_for_bridge_dir(bridge_dir),
+            build_opencode_provider_config(gateway),
+        )
+        # Pin the per-prompt model to the synthesized provider/endpoint id.
+        model_override = gateway.qualified_model
+
     server = OpenCodeNativeServer(bridge_dir=bridge_dir, workspace=launch_config.workspace)
     await server.start()
     _AUTO_OPENCODE_SERVERS[session_id] = server
@@ -1076,6 +1101,23 @@ def _opencode_native_model_from_spec(agent_spec: Any | None) -> str | None:
 
         return _resolve_spec_model(getattr(agent_spec, "spec", agent_spec))
     except Exception:  # noqa: BLE001 - model resolution is best effort.
+        return None
+
+
+def _opencode_native_profile_from_spec(agent_spec: Any | None) -> str | None:
+    """
+    Resolve the Databricks profile from a resolved agent spec, if any.
+
+    :param agent_spec: Optional resolved agent spec.
+    :returns: The spec's ``executor.config.profile``, or ``None``.
+    """
+    if agent_spec is None:
+        return None
+    try:
+        spec = getattr(agent_spec, "spec", agent_spec)
+        profile = spec.executor.config.get("profile")
+        return str(profile) if profile else None
+    except Exception:  # noqa: BLE001 - profile resolution is best effort.
         return None
 
 
@@ -6238,6 +6280,49 @@ def create_runner_app(
                             _publish_event,
                             session_id,
                             "Cursor",
+                            exc,
+                        )
+                    finally:
+                        _publish_terminal_pending(_publish_event, session_id, False)
+
+        if harness_name == "opencode-native":
+            # Host/web-UI session-creation path: boot the runner-owned
+            # ``opencode serve`` + SSE forwarder + ``opencode attach`` terminal
+            # so the web UI has a terminal+chat view to embed — the native-server
+            # sibling of the codex-native branch above. (The on-demand
+            # ``ensure_native_terminal`` message path also creates it; the
+            # per-session lock makes the two idempotent.)
+            _opencode_ensure_lock = _opencode_terminal_ensure_locks.setdefault(
+                session_id, asyncio.Lock()
+            )
+            async with _opencode_ensure_lock:
+                _tr = resource_registry.terminal_registry
+                _has_opencode_terminal = (
+                    _tr is not None and _tr.get(session_id, "opencode", "main") is not None
+                )
+                if not _has_opencode_terminal:
+                    _publish_terminal_pending(_publish_event, session_id, True)
+                    try:
+                        try:
+                            _opencode_spec = await _resolve_session_agent_spec(session_id)
+                        except OmnigentError:
+                            _opencode_spec = None
+                        await _auto_create_opencode_terminal(
+                            session_id,
+                            resource_registry,
+                            _publish_event,
+                            agent_spec=_opencode_spec,
+                            server_client=server_client,
+                        )
+                    except Exception as exc:
+                        _logger.exception(
+                            "Failed to auto-create opencode terminal for %s",
+                            session_id,
+                        )
+                        _publish_native_terminal_start_error(
+                            _publish_event,
+                            session_id,
+                            "OpenCode",
                             exc,
                         )
                     finally:
