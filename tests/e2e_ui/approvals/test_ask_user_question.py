@@ -89,7 +89,7 @@ def test_ask_user_question_form_renders_and_submits(
             )
             resp.raise_for_status()
             result_holder["response"] = resp.json()
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             result_holder["error"] = exc
 
     hook_thread = threading.Thread(target=_post_hook, daemon=True)
@@ -120,6 +120,8 @@ def test_ask_user_question_form_renders_and_submits(
 
     hook_thread.join(timeout=30)
     if "error" in result_holder:
-        raise AssertionError(f"hook thread failed: {result_holder['error']}") from result_holder["error"]
+        raise AssertionError(f"hook thread failed: {result_holder['error']}") from result_holder[
+            "error"
+        ]
 
     _wait_for(lambda: not _pending_elicitations(base_url, session_id))

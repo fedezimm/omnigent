@@ -69,14 +69,17 @@ def test_exit_plan_mode_review_renders_and_approves(
                 json={
                     "tool_name": "ExitPlanMode",
                     "tool_input": {
-                        "plan": "- Add comment `<!-- Maintained by the Platform team -->` as the final line of `README.md`."
+                        "plan": (
+                            "- Add comment `<!-- Maintained by the Platform team -->`"
+                            " as the final line of `README.md`."
+                        )
                     },
                 },
                 timeout=60.0,
             )
             resp.raise_for_status()
             result_holder["response"] = resp.json()
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             result_holder["error"] = exc
 
     hook_thread = threading.Thread(target=_post_hook, daemon=True)
@@ -103,6 +106,8 @@ def test_exit_plan_mode_review_renders_and_approves(
 
     hook_thread.join(timeout=30)
     if "error" in result_holder:
-        raise AssertionError(f"hook thread failed: {result_holder['error']}") from result_holder["error"]
+        raise AssertionError(f"hook thread failed: {result_holder['error']}") from result_holder[
+            "error"
+        ]
 
     _wait_for(lambda: not _pending_elicitations(base_url, session_id))
