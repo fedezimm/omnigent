@@ -330,14 +330,29 @@ jobs:
           pathlib.Path("/tmp/review_prompt.txt").write_text(prompt)
           PYEOF
 
+      - name: Mint read-only token for Polly
+        # Mint an installation token restricted to pull_requests:read +
+        # contents:read so Polly can use gh CLI to fetch the diff and PR
+        # context without inheriting the write-scoped github.token.
+        # Absent when the App isn't configured — Polly gets no GH_TOKEN.
+        id: polly-ro-token
+        if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true' && vars.OMNIGENT_BOT_APP_ID != ''
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1  # v3.2.0
+        with:
+          app-id: ${{ vars.OMNIGENT_BOT_APP_ID }}
+          private-key: ${{ secrets.OMNIGENT_BOT_APP_KEY }}
+          permission-pull-requests: read
+          permission-contents: read
+
       - name: Run Polly review
         if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
         id: polly
         env:
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
-          # Read-only token so Polly can fetch the full diff and file list
-          # via gh CLI without a size cap.
-          GH_TOKEN: ${{ github.token }}
+          # Read-only token (pull_requests:read + contents:read) so Polly can
+          # fetch the full diff via gh CLI without a write primitive on
+          # attacker-controlled PR content. Absent when App isn't configured.
+          GH_TOKEN: ${{ steps.polly-ro-token.outputs.token }}
           POLLY_PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
           POLLY_REPO: ${{ github.repository }}
         run: |
