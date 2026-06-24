@@ -99,6 +99,7 @@ def _type_into_tui(page: Page, text: str) -> None:
     page.keyboard.press("Enter")
 
 
+@pytest.mark.nightly
 @pytest.mark.timeout(300)
 def test_native_codex_message_render_parity(
     page: Page,
