@@ -31,6 +31,7 @@ from omnigent.inner.copilot_executor import (
     _resolve_model,
 )
 from omnigent.inner.executor import (
+    ExecutorConfig,
     ExecutorError,
     Message,
     ReasoningChunk,
@@ -66,9 +67,10 @@ class _FakeEvent:
 
 
 class _FakeSession:
-    def __init__(self, state: dict[str, Any]) -> None:
+    def __init__(self, state: dict[str, Any], send_exc: Exception | None = None) -> None:
         self._state = state
         self._handlers: list[Any] = []
+        self._send_exc = send_exc
 
     def on(self, handler: Any) -> Any:
         self._handlers.append(handler)
@@ -83,6 +85,9 @@ class _FakeSession:
     async def send_and_wait(self, prompt: str, *, timeout: float = 60.0) -> Any:
         self._state["sent"].append(prompt)
         await asyncio.sleep(0)
+        if self._send_exc is not None and self._state.get("send_exc_remaining", 0) > 0:
+            self._state["send_exc_remaining"] -= 1
+            raise self._send_exc
         scripts: list[list[tuple[str, dict[str, Any]]]] = self._state["turn_scripts"]
         script = scripts.pop(0) if scripts else []
         final = None
@@ -122,10 +127,15 @@ def _install_fake_copilot(
     *,
     create_exc: Exception | None = None,
     start_exc: Exception | None = None,
+    send_exc: Exception | None = None,
+    send_exc_times: int = 1,
 ) -> dict[str, Any]:
     """Install a fake ``copilot`` module; return a capture dict.
 
     *turn_scripts* is one list of scripted events per ``send_and_wait`` call.
+    *send_exc*, when set, makes ``send_and_wait`` raise it for the first
+    *send_exc_times* calls (then behave normally), so the mid-turn
+    ``send_and_wait`` failure path can be exercised and recovery verified.
     """
     state: dict[str, Any] = {
         "client_kwargs": [],
@@ -136,6 +146,7 @@ def _install_fake_copilot(
         "session_closed": 0,
         "aborted": 0,
         "turn_scripts": list(turn_scripts or []),
+        "send_exc_remaining": send_exc_times if send_exc is not None else 0,
     }
 
     class _FakeClient:
@@ -154,7 +165,7 @@ def _install_fake_copilot(
             state["create_kwargs"].append(kwargs)
             if create_exc is not None:
                 raise create_exc
-            return _FakeSession(state)
+            return _FakeSession(state, send_exc=send_exc)
 
     class _Tool:
         def __init__(
@@ -379,7 +390,8 @@ async def test_run_turn_tool_call_request_and_complete(
     comps = [e for e in events if isinstance(e, ToolCallComplete)]
     assert reqs and reqs[0].name == "sys_session_send" and reqs[0].args == {"to": "x"}
     assert comps and comps[0].name == "sys_session_send"
-    assert comps[0].status != ToolCallStatus.ERROR
+    assert comps[0].status == ToolCallStatus.SUCCESS
+    assert comps[0].result == "done" and comps[0].error is None
     await ex.close()
 
 
@@ -394,7 +406,7 @@ async def test_run_turn_tool_complete_error(monkeypatch: pytest.MonkeyPatch) -> 
                     "TOOL_EXECUTION_COMPLETE",
                     toolCallId="c1",
                     success=False,
-                    error="tool blew up",
+                    error={"message": "tool blew up", "code": "ENOENT"},
                 ),
                 _ev("ASSISTANT_MESSAGE", content="done"),
             ]
@@ -403,7 +415,10 @@ async def test_run_turn_tool_complete_error(monkeypatch: pytest.MonkeyPatch) -> 
     ex = CopilotExecutor(github_token="gho_x")
     events = [e async for e in ex.run_turn([_user("go")], [], "SYS")]
     comps = [e for e in events if isinstance(e, ToolCallComplete)]
-    assert comps and comps[0].status == ToolCallStatus.ERROR and "tool blew up" in comps[0].error
+    assert comps and comps[0].status == ToolCallStatus.ERROR
+    # The SDK delivers ``error`` as a {"message", "code"} object; the executor
+    # surfaces the message, not the dict's Python repr.
+    assert comps[0].error == "tool blew up"
     await ex.close()
 
 
@@ -533,3 +548,336 @@ async def test_error_after_partial_text_is_not_masked(monkeypatch: pytest.Monkey
     completes = [e for e in events if isinstance(e, TurnComplete)]
     assert errors and "model call failed mid-stream" in errors[0].message
     assert not completes  # the turn is failed, not reported complete
+
+
+# ---------------------------------------------------------------------------
+# Policy gates (PHASE_LLM_REQUEST / PHASE_LLM_RESPONSE) — parity with the
+# cursor / pi / claude-sdk executors.
+# ---------------------------------------------------------------------------
+
+
+def _verdict(action: str, reason: str = "") -> Any:
+    return types.SimpleNamespace(action=action, reason=reason)
+
+
+@pytest.mark.asyncio
+async def test_policy_request_deny_blocks_before_send(monkeypatch: pytest.MonkeyPatch) -> None:
+    state = _install_fake_copilot(
+        monkeypatch, [[_ev("ASSISTANT_MESSAGE", content="must not send")]]
+    )
+    ex = CopilotExecutor(github_token="gho_x")
+
+    async def deny_request(phase: str, ctx: dict[str, Any]) -> Any:
+        if phase == "PHASE_LLM_REQUEST":
+            return _verdict("POLICY_ACTION_DENY", "blocked req")
+        return _verdict("POLICY_ACTION_ALLOW")
+
+    ex._policy_evaluator = deny_request
+    events = [e async for e in ex.run_turn([_user("go")], [], "SYS")]
+    errors = [e for e in events if isinstance(e, ExecutorError)]
+    completes = [e for e in events if isinstance(e, TurnComplete)]
+    assert errors and "call denied by policy: blocked req" in errors[0].message
+    assert not completes
+    assert state["sent"] == []  # denied before send_and_wait ran
+    await ex.close()
+
+
+@pytest.mark.asyncio
+async def test_policy_response_deny_blocks_turn_complete(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_fake_copilot(
+        monkeypatch,
+        [
+            [
+                _ev("ASSISTANT_MESSAGE_DELTA", deltaContent="leaked"),
+                _ev("ASSISTANT_MESSAGE", content="leaked"),
+            ]
+        ],
+    )
+    ex = CopilotExecutor(github_token="gho_x")
+
+    async def deny_response(phase: str, ctx: dict[str, Any]) -> Any:
+        if phase == "PHASE_LLM_RESPONSE":
+            return _verdict("POLICY_ACTION_DENY", "bad output")
+        return _verdict("POLICY_ACTION_ALLOW")
+
+    ex._policy_evaluator = deny_response
+    events = [e async for e in ex.run_turn([_user("go")], [], "SYS")]
+    errors = [e for e in events if isinstance(e, ExecutorError)]
+    completes = [e for e in events if isinstance(e, TurnComplete)]
+    assert errors and "response denied by policy: bad output" in errors[0].message
+    assert not completes
+    await ex.close()
+
+
+@pytest.mark.asyncio
+async def test_policy_allow_consults_both_phases_and_completes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_copilot(
+        monkeypatch,
+        [
+            [
+                _ev("ASSISTANT_MESSAGE_DELTA", deltaContent="hi"),
+                _ev("ASSISTANT_MESSAGE", content="hi"),
+            ]
+        ],
+    )
+    ex = CopilotExecutor(github_token="gho_x")
+    phases: list[str] = []
+
+    async def allow(phase: str, ctx: dict[str, Any]) -> Any:
+        phases.append(phase)
+        return _verdict("POLICY_ACTION_ALLOW")
+
+    ex._policy_evaluator = allow
+    events = [e async for e in ex.run_turn([_user("go")], [], "SYS")]
+    completes = [e for e in events if isinstance(e, TurnComplete)]
+    assert completes and completes[0].response == "hi"
+    assert phases == ["PHASE_LLM_REQUEST", "PHASE_LLM_RESPONSE"]
+    await ex.close()
+
+
+# ---------------------------------------------------------------------------
+# Session restart triggers (tool set + model), beyond the system-prompt case.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_session_restart_on_tools_change(monkeypatch: pytest.MonkeyPatch) -> None:
+    state = _install_fake_copilot(
+        monkeypatch,
+        [[_ev("ASSISTANT_MESSAGE", content="one")], [_ev("ASSISTANT_MESSAGE", content="two")]],
+    )
+    ex = CopilotExecutor(github_token="gho_x")
+    tools_a = [
+        {"name": "alpha", "description": "", "parameters": {"type": "object", "properties": {}}}
+    ]
+    tools_b = [
+        {"name": "beta", "description": "", "parameters": {"type": "object", "properties": {}}}
+    ]
+    _ = [e async for e in ex.run_turn([_user("first")], tools_a, "SYS")]
+    _ = [e async for e in ex.run_turn([_user("second")], tools_b, "SYS")]
+    # Tool set changed → fresh session, old client stopped (so removed tools
+    # can't stay callable and new tools aren't missing).
+    assert len(state["create_kwargs"]) == 2
+    assert state["client_closed"] >= 1
+    await ex.close()
+
+
+@pytest.mark.asyncio
+async def test_session_restart_on_model_change(monkeypatch: pytest.MonkeyPatch) -> None:
+    state = _install_fake_copilot(
+        monkeypatch,
+        [[_ev("ASSISTANT_MESSAGE", content="one")], [_ev("ASSISTANT_MESSAGE", content="two")]],
+    )
+    ex = CopilotExecutor(github_token="gho_x")
+    _ = [
+        e
+        async for e in ex.run_turn(
+            [_user("first")], [], "SYS", ExecutorConfig(model="claude-haiku-4.5")
+        )
+    ]
+    _ = [
+        e
+        async for e in ex.run_turn(
+            [_user("second")], [], "SYS", ExecutorConfig(model="gpt-5-mini")
+        )
+    ]
+    assert len(state["create_kwargs"]) == 2
+    assert state["create_kwargs"][0]["model"] == "claude-haiku-4.5"
+    assert state["create_kwargs"][1]["model"] == "gpt-5-mini"
+    await ex.close()
+
+
+# ---------------------------------------------------------------------------
+# Mid-turn send_and_wait failure: retryable + session dropped, then recovers.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_send_and_wait_failure_is_retryable_and_recreates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _install_fake_copilot(
+        monkeypatch,
+        [[_ev("ASSISTANT_MESSAGE", content="recovered")]],
+        send_exc=RuntimeError("turn wedged"),
+    )
+    ex = CopilotExecutor(github_token="gho_x")
+    first = [e async for e in ex.run_turn([_user("go")], [], "SYS")]
+    errors = [e for e in first if isinstance(e, ExecutorError)]
+    assert errors and "copilot-sdk turn failed: turn wedged" in errors[0].message
+    assert errors[0].retryable is True
+    assert state["client_closed"] >= 1  # the failed turn dropped the session
+    # Next turn re-creates the session (the dropped one is gone) and succeeds.
+    second = [e async for e in ex.run_turn([_user("again")], [], "SYS")]
+    completes = [e for e in second if isinstance(e, TurnComplete)]
+    assert completes and completes[0].response == "recovered"
+    assert len(state["create_kwargs"]) == 2
+    await ex.close()
+
+
+# ---------------------------------------------------------------------------
+# TOOL_EXECUTION_COMPLETE: SDK wire-shape unwrapping + status classification.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_tool_complete_result_unwrapped_from_sdk_wrapper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The SDK wraps a tool result as {"content": ..., "detailedContent": ...};
+    # the executor carries the bare content, not the wrapper dict.
+    _install_fake_copilot(
+        monkeypatch,
+        [
+            [
+                _ev("TOOL_EXECUTION_START", toolName="sys_x", toolCallId="c1"),
+                _ev(
+                    "TOOL_EXECUTION_COMPLETE",
+                    toolCallId="c1",
+                    success=True,
+                    result={"content": "the answer is 42", "detailedContent": "the answer is 42"},
+                ),
+                _ev("ASSISTANT_MESSAGE", content="ok"),
+            ]
+        ],
+    )
+    ex = CopilotExecutor(github_token="gho_x")
+    events = [e async for e in ex.run_turn([_user("go")], [], "SYS")]
+    comps = [e for e in events if isinstance(e, ToolCallComplete)]
+    assert comps and comps[0].status == ToolCallStatus.SUCCESS
+    assert comps[0].result == "the answer is 42"
+    await ex.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "result,expected",
+    [
+        ({"blocked": True, "reason": "policy"}, ToolCallStatus.BLOCKED),
+        ({"cancelled": True}, ToolCallStatus.CANCELLED),
+    ],
+)
+async def test_tool_complete_blocked_and_cancelled_classification(
+    monkeypatch: pytest.MonkeyPatch, result: dict[str, Any], expected: ToolCallStatus
+) -> None:
+    _install_fake_copilot(
+        monkeypatch,
+        [
+            [
+                _ev("TOOL_EXECUTION_START", toolName="sys_x", toolCallId="c1"),
+                _ev("TOOL_EXECUTION_COMPLETE", toolCallId="c1", success=True, result=result),
+                _ev("ASSISTANT_MESSAGE", content="ok"),
+            ]
+        ],
+    )
+    ex = CopilotExecutor(github_token="gho_x")
+    events = [e async for e in ex.run_turn([_user("go")], [], "SYS")]
+    comps = [e for e in events if isinstance(e, ToolCallComplete)]
+    assert comps and comps[0].status == expected
+    await ex.close()
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle + edge branches: interrupt, empty prompt, no-executor, formatting.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_interrupt_session_drops_and_recreates(monkeypatch: pytest.MonkeyPatch) -> None:
+    state = _install_fake_copilot(
+        monkeypatch,
+        [[_ev("ASSISTANT_MESSAGE", content="one")], [_ev("ASSISTANT_MESSAGE", content="two")]],
+    )
+    ex = CopilotExecutor(github_token="gho_x")
+    assert await ex.interrupt_session("unknown") is False  # no live session
+    _ = [e async for e in ex.run_turn([_user("first")], [], "SYS")]
+    assert await ex.interrupt_session("conv1") is True
+    assert state["client_closed"] >= 1
+    _ = [e async for e in ex.run_turn([_user("second")], [], "SYS")]
+    assert len(state["create_kwargs"]) == 2  # session re-created after interrupt
+    await ex.close()
+
+
+@pytest.mark.asyncio
+async def test_empty_prompt_completes_without_send(monkeypatch: pytest.MonkeyPatch) -> None:
+    state = _install_fake_copilot(monkeypatch, [[_ev("ASSISTANT_MESSAGE", content="unused")]])
+    ex = CopilotExecutor(github_token="gho_x")
+    msgs: list[Message] = [{"role": "user", "content": "", "session_id": "conv1"}]
+    events = [e async for e in ex.run_turn(msgs, [], "SYS")]
+    completes = [e for e in events if isinstance(e, TurnComplete)]
+    assert len(completes) == 1 and completes[0].response is None
+    assert state["sent"] == []  # nothing sent for an empty prompt
+    await ex.close()
+
+
+@pytest.mark.asyncio
+async def test_bridged_tool_handler_no_executor_wired(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_fake_copilot(monkeypatch)
+    ex = CopilotExecutor()  # _tool_executor stays None (single-process / pre-turn)
+    handler = ex._make_handler("sys_x")
+    result = await handler(types.SimpleNamespace(arguments={}, tool_call_id="c"))
+    assert result.result_type == "failure"
+    assert "no tool executor wired" in result.error
+
+
+@pytest.mark.asyncio
+async def test_paragraph_break_between_pre_and_post_tool_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Pre-tool narration, a tool call, then post-tool narration must not render
+    # run-on: a paragraph break is inserted between the two text segments.
+    _install_fake_copilot(
+        monkeypatch,
+        [
+            [
+                _ev("ASSISTANT_MESSAGE_DELTA", deltaContent="before"),
+                _ev("TOOL_EXECUTION_START", toolName="sys_x", toolCallId="c1"),
+                _ev("TOOL_EXECUTION_COMPLETE", toolCallId="c1", success=True, result="done"),
+                _ev("ASSISTANT_MESSAGE_DELTA", deltaContent="after"),
+                _ev("ASSISTANT_MESSAGE", content="before\n\nafter"),
+            ]
+        ],
+    )
+    ex = CopilotExecutor(github_token="gho_x")
+    events = [e async for e in ex.run_turn([_user("go")], [], "SYS")]
+    text = "".join(e.text for e in events if isinstance(e, TextChunk))
+    assert text == "before\n\nafter"
+    completes = [e for e in events if isinstance(e, TurnComplete)]
+    assert completes and completes[0].response == "before\n\nafter"
+    await ex.close()
+
+
+@pytest.mark.asyncio
+async def test_run_turn_usage_accumulates_cache_read_through_events(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Two ASSISTANT_USAGE events (one per model call) accumulate end-to-end,
+    # including cacheReadTokens, and total_tokens excludes the cache count.
+    _install_fake_copilot(
+        monkeypatch,
+        [
+            [
+                _ev(
+                    "ASSISTANT_USAGE",
+                    model="claude-haiku-4.5",
+                    inputTokens=10,
+                    outputTokens=2,
+                    cacheReadTokens=5,
+                ),
+                _ev("ASSISTANT_USAGE", inputTokens=3, outputTokens=1, cacheReadTokens=4),
+                _ev("ASSISTANT_MESSAGE", content="ok"),
+            ]
+        ],
+    )
+    ex = CopilotExecutor(github_token="gho_x")
+    events = [e async for e in ex.run_turn([_user("hi")], [], "SYS")]
+    completes = [e for e in events if isinstance(e, TurnComplete)]
+    assert completes and completes[0].usage == {
+        "input_tokens": 13,
+        "output_tokens": 3,
+        "cache_read_input_tokens": 9,
+        "total_tokens": 16,
+    }
+    await ex.close()

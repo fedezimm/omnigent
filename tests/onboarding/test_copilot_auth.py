@@ -106,6 +106,27 @@ def test_dangling_reference_is_soft_none(tmp_path: Path) -> None:
     assert copilot_github_token_configured() is False
 
 
+def test_resolve_from_inline_github_token_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A hand-edited config with only the inline ``github_token`` (no
+    # ``github_token_ref``) still resolves via the right-hand ``or`` fallback.
+    _write_config(tmp_path, {"copilot": {"github_token": "env:GH_TOKEN"}})
+    monkeypatch.setenv("GH_TOKEN", "gho_inline")
+    assert copilot_github_token_ref() == "env:GH_TOKEN"
+    assert resolve_copilot_github_token() == "gho_inline"
+    assert copilot_github_token_configured() is True
+
+
+def test_dangling_keychain_reference_is_soft_none(tmp_path: Path) -> None:
+    # A keychain ref to a name that was never stored resolves to None (never
+    # raises) and reads as not-configured — the realistic "deleted keychain
+    # entry" case, distinct from the env-var dangling case above.
+    _write_config(tmp_path, {"copilot": {"github_token_ref": "keychain:copilot-never-stored"}})
+    assert resolve_copilot_github_token() is None
+    assert copilot_github_token_configured() is False
+
+
 def test_settings_shape() -> None:
     assert copilot_github_token_settings("keychain:copilot") == {
         "copilot": {"github_token_ref": "keychain:copilot"}

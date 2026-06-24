@@ -70,7 +70,31 @@ def test_build_executor_threads_env(monkeypatch: pytest.MonkeyPatch) -> None:
     assert executor._agent_name == "cop"
 
 
-def test_create_app_builds_fastapi() -> None:
+def test_build_executor_threads_os_env_bundle_dir_and_ambient_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pathlib import Path
+
+    # No HARNESS_COPILOT_CWD / GITHUB_TOKEN: cwd falls back to os_env.cwd and the
+    # token falls back to an ambient GH_TOKEN.
+    monkeypatch.setenv(
+        "HARNESS_COPILOT_OS_ENV",
+        json.dumps({"type": "caller_process", "cwd": "/tmp/oe", "sandbox": {"type": "none"}}),
+    )
+    monkeypatch.setenv("HARNESS_COPILOT_BUNDLE_DIR", "/tmp/bundle")
+    monkeypatch.setenv("GH_TOKEN", "gho_ambient")
+    executor = ch._build_copilot_executor()
+    assert isinstance(executor, CopilotExecutor)
+    assert executor._os_env_spec is not None and executor._os_env_spec.cwd == "/tmp/oe"
+    assert executor._cwd == "/tmp/oe"  # cwd fell back to os_env.cwd
+    assert executor._bundle_dir == Path("/tmp/bundle")
+    assert executor._github_token == "gho_ambient"  # ambient fallback
+
+
+def test_create_app_exposes_executor_adapter_routes() -> None:
     app = ch.create_app()
-    # The ExecutorAdapter builds a FastAPI app; just assert it has routes.
-    assert hasattr(app, "routes")
+    paths = {getattr(r, "path", "") for r in app.routes}
+    # The ExecutorAdapter wires the harness HTTP contract — assert the real
+    # endpoints exist, not merely that the object has a ``routes`` attribute.
+    assert "/health" in paths
+    assert any("/v1/sessions/" in p and p.endswith("/events") for p in paths)

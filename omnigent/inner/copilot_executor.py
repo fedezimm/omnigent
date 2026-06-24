@@ -557,13 +557,14 @@ class CopilotExecutor(Executor):
             elif etype.endswith("TOOL_EXECUTION_COMPLETE"):
                 call_id = data.get("toolCallId")
                 name = state.call_names.get(str(call_id), "tool") if call_id else "tool"
-                result = data.get("result")
+                result = _unwrap_tool_result(data.get("result"))
                 classification = classify_tool_result(result)
                 status = classification.status
                 error = classification.error or None
-                if data.get("success") is False or data.get("error"):
+                raw_error = data.get("error")
+                if data.get("success") is False or raw_error:
                     status = ToolCallStatus.ERROR
-                    error = error or str(data.get("error") or "tool call failed")
+                    error = error or _unwrap_tool_error(raw_error) or "tool call failed"
                 separate_next_text = True
                 yield ToolCallComplete(
                     name=name,
@@ -729,6 +730,50 @@ def _event_data(event: Any) -> dict[str, Any]:  # type: ignore[explicit-any]
     if isinstance(data_attr, dict):
         return data_attr
     return {}
+
+
+# SDK ``ToolExecutionCompleteResult.to_dict`` wraps the payload as
+# ``{"content": ..., "contents": [...], "detailedContent": ..., "uiResource": ...}``
+# and ``ToolExecutionCompleteError.to_dict`` as ``{"message": ..., "code": ...}``.
+_TOOL_RESULT_WRAPPER_KEYS = ("content", "contents", "detailedContent", "uiResource")
+
+
+def _unwrap_tool_result(raw: Any) -> Any:  # type: ignore[explicit-any]
+    """Unwrap the SDK ``ToolExecutionCompleteResult`` wrapper to its content payload.
+
+    A ``TOOL_EXECUTION_COMPLETE`` ``result`` arrives in wire form as a wrapper
+    dict (``{"content": ..., "detailedContent": ..., ...}``). Carry the bare
+    content downstream (classification, tracing, the persisted ``ToolCallComplete``
+    result) rather than the wrapper — matching the bare-payload convention the
+    peer executors use. Only a recognized wrapper shape is unwrapped, so an
+    Omnigent-convention result (e.g. ``{"blocked": True}``) passes through
+    untouched for :func:`classify_tool_result`.
+    """
+    if isinstance(raw, dict) and any(k in raw for k in _TOOL_RESULT_WRAPPER_KEYS):
+        for key in ("content", "detailedContent"):
+            value = raw.get(key)
+            if value is not None:
+                return value
+    return raw
+
+
+def _unwrap_tool_error(raw: Any) -> str | None:  # type: ignore[explicit-any]
+    """Extract the message from the SDK's structured tool error.
+
+    A failed ``TOOL_EXECUTION_COMPLETE`` ``error`` arrives as
+    ``{"message": ..., "code": ...}`` (``ToolExecutionCompleteError.to_dict``);
+    surface the ``message`` rather than the dict's Python repr (which would leak
+    ``"{'message': ..., 'code': ...}"`` into the tool error shown to the
+    model / recorded on the span). A bare string passes through; anything else
+    yields ``None`` so the caller can fall back to a generic message.
+    """
+    if isinstance(raw, dict):
+        message = raw.get("message")
+        if isinstance(message, str) and message:
+            return message
+    if isinstance(raw, str) and raw:
+        return raw
+    return None
 
 
 def _final_message_text(event: Any) -> str:  # type: ignore[explicit-any]
