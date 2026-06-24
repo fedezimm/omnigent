@@ -169,7 +169,14 @@ def test_terminal_command_invalid_kind() -> None:
 
 def test_non_content_item_types_complete() -> None:
     """All expected non-content types are present."""
-    expected = {"compaction", "error", "resource_event", "routing_decision", "slash_command", "terminal_command"}
+    expected = {
+        "compaction",
+        "error",
+        "resource_event",
+        "routing_decision",
+        "slash_command",
+        "terminal_command",
+    }
     assert expected == NON_CONTENT_ITEM_TYPES
 
 

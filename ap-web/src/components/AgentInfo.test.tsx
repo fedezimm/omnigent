@@ -476,7 +476,7 @@ describe("AgentInfoButton intelligent routing section", () => {
     };
     renderButtonWithSession(AGENT_WITH_BOTH, "conv_child", child, true);
     fireEvent.click(screen.getByTestId("agent-info-trigger"));
-    expect(screen.getByText("databricks_coding_agent")).toBeInTheDocument();
+    expect(screen.getByText("Databricks_coding_agent")).toBeInTheDocument();
     expect(screen.queryByTestId("intelligent-routing-section")).toBeNull();
   });
 
@@ -501,7 +501,7 @@ describe("AgentInfoButton intelligent routing section", () => {
     );
     openInfo();
     // The popover itself opened (agent name renders) — only the section is absent.
-    expect(screen.getByText("databricks_coding_agent")).toBeInTheDocument();
+    expect(screen.getByText("Databricks_coding_agent")).toBeInTheDocument();
     expect(screen.queryByTestId("intelligent-routing-section")).toBeNull();
   });
 
