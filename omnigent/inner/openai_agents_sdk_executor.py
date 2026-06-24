@@ -627,7 +627,7 @@ class _AgentsSessionState:
         before starting. Set by :meth:`interrupt_session`.
     """
 
-    sdk_session: _SanitizingSession
+    sdk_session: Any  # type: ignore[explicit-any]  # _SanitizingSession or OpenAIResponsesCompactionSession
     started: bool = False
     # agents.Agent[Any] instance; cached for reuse across turns.
     agent: SDKAgent = None
@@ -1075,7 +1075,18 @@ class OpenAIAgentsSDKExecutor(Executor):
         if state is not None:
             return state
 
-        sdk_session = _SanitizingSession(agents_sdk.SQLiteSession(session_key))
+        underlying = _SanitizingSession(agents_sdk.SQLiteSession(session_key))
+        try:
+            from agents.memory import OpenAIResponsesCompactionSession
+
+            sdk_session = OpenAIResponsesCompactionSession(
+                session_id=session_key,
+                underlying_session=underlying,
+            )
+        except (ImportError, AttributeError):
+            # Older SDK versions without compaction support — fall back
+            # to the plain session.
+            sdk_session = underlying
         state = _AgentsSessionState(sdk_session=sdk_session)
         self._session_states[session_key] = state
         return state
@@ -1596,11 +1607,9 @@ class OpenAIAgentsSDKExecutor(Executor):
                 if state.interrupt_requested:
                     return
                 if _is_context_length_exceeded(exc):
-                    # Let the runtime compaction layer handle context
-                    # overflow.  Re-raising propagates the original
-                    # exception to the ExecutorAdapter, whose error
-                    # classifier maps it to ``context_length_exceeded``
-                    # so the workflow's reactive compaction fires.
+                    # Re-raise so the ExecutorAdapter's error classifier
+                    # maps it to ``context_length_exceeded`` and the
+                    # runner surfaces the overflow to the user.
                     raise
                 from .databricks_executor import DatabricksAuthError
 
@@ -1750,6 +1759,27 @@ class OpenAIAgentsSDKExecutor(Executor):
                 if cached_tok:
                     turn_usage["cache_read_input_tokens"] = cached_tok
         _notify_usage_from_dict(model=model, usage=turn_usage)
+
+        # Emit CompactionComplete if the SDK compacted this turn.
+        # OpenAI's compaction produces encrypted opaque tokens (not
+        # a human-readable summary), so we emit a descriptive
+        # placeholder. The runner persists it as a compaction item
+        # boundary for session resume.
+        if result is not None:
+            for item in result.new_items:
+                if getattr(item, "type", None) == "compaction_item":
+                    from omnigent.inner.executor import CompactionComplete
+
+                    _compaction_tokens = 0
+                    if turn_usage is not None:
+                        _compaction_tokens = turn_usage.get("context_tokens", 0) or 0
+                    yield CompactionComplete(
+                        summary="[OpenAI Responses API compaction — context was automatically compacted]",
+                        token_count=_compaction_tokens,
+                        model=model,
+                    )
+                    break
+
         yield TurnComplete(response=final_text, usage=turn_usage)
 
     @staticmethod
