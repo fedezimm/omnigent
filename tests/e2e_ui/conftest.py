@@ -2171,13 +2171,17 @@ def _temp_omnigent_mock_config(
                     default: {_CLAUDE_MOCK_MODEL}
             """)
     else:  # codex
+        # The Codex CLI uses base_url as the full API prefix (it sends
+        # requests to {base_url}/responses, NOT {base_url}/v1/responses),
+        # so we need the /v1 suffix. (The Anthropic SDK above auto-appends
+        # /v1/messages to its base_url, so it does NOT need the suffix.)
         mock_config = textwrap.dedent(f"""\
             providers:
               mock-codex:
                 kind: key
                 default: [openai]
                 openai:
-                  base_url: "{mock_llm_server_url}"
+                  base_url: "{mock_llm_server_url}/v1"
                   api_key: "mock-key"
                   wire_api: responses
                   models:
