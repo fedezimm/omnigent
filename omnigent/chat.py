@@ -14,7 +14,6 @@ import logging
 import os
 import secrets
 import shutil
-import signal
 import subprocess
 import sys
 import tempfile
@@ -56,6 +55,7 @@ from omnigent._wrapper_labels import (
 from omnigent.conversation_browser import open_conversation_link_if_enabled
 from omnigent.errors import OmnigentError
 from omnigent.harness_aliases import canonicalize_harness
+from omnigent.inner import _proc
 from omnigent.inner.databricks_executor import _DatabricksBearerAuth, _read_databrickscfg
 from omnigent.native_coding_agents import native_coding_agent_for_wrapper_label
 from omnigent.spec import load as load_spec
@@ -1049,6 +1049,14 @@ def _redirect_native_resume_if_needed(
             progress=progress,
         )
         return True
+    if native_agent.key == "cursor":
+        _run_cursor_native_resume_redirect(
+            base_url=base_url,
+            conversation_id=conversation_id,
+            auto_open_conversation=auto_open_conversation,
+            progress=progress,
+        )
+        return True
     return False
 
 
@@ -1176,6 +1184,46 @@ def _run_pi_native_resume_redirect(
         server=base_url,
         session_id=conversation_id,
         pi_args=(),
+        auto_open_conversation=auto_open_conversation,
+    )
+
+
+def _run_cursor_native_resume_redirect(
+    *,
+    base_url: str,
+    conversation_id: str,
+    auto_open_conversation: bool,
+    progress: RunnerStartupProgress | None,
+) -> None:
+    """
+    Hand a cursor-native conversation back to ``omnigent cursor``.
+
+    The cursor-native session is driven by the ``cursor-agent`` TUI in a
+    runner-owned tmux pane, and the forwarder mirrors that transcript back
+    into the conversation. Resuming through the Omnigent REPL would instead
+    run an Omnigent turn per message (which persists its own user item) *and*
+    leave the forwarder mirroring the same message from the cursor store —
+    recording each user message twice. Redirecting to ``omnigent cursor``'s
+    direct tmux attach keeps the TUI the single source of turns.
+
+    :param base_url: Omnigent server base URL.
+    :param conversation_id: Omnigent conversation id.
+    :param auto_open_conversation: Browser-open preference for the wrapper.
+    :param progress: Optional Omnigent startup spinner to finish before redirect.
+    :returns: None.
+    """
+    _finish_native_redirect_progress(
+        progress=progress,
+        conversation_id=conversation_id,
+        wrapper_name="cursor-native",
+        native_command="cursor",
+    )
+    from omnigent.cursor_native import run_cursor_native
+
+    run_cursor_native(
+        server=base_url,
+        session_id=conversation_id,
+        cursor_args=(),
         auto_open_conversation=auto_open_conversation,
     )
 
@@ -3437,7 +3485,7 @@ def _start_local_server(
             env=child_env,
             stdout=log_fh,
             stderr=log_fh,
-            start_new_session=True,
+            **_proc.spawn_kwargs(),
         )
     finally:
         log_fh.close()
@@ -3559,14 +3607,11 @@ def _stop_server(proc: subprocess.Popen[bytes]) -> None:
     :param proc: The server subprocess.
     """
     if proc.poll() is None:
-        with contextlib.suppress(ProcessLookupError):
-            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            proc.wait(timeout=5)
+        _proc.terminate_tree(proc, grace=5)
+        if proc.poll() is None:
+            _proc.kill_tree(proc)
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                proc.wait(timeout=5)
 
 
 def _stop_local_server(server: LocalServer) -> None:
