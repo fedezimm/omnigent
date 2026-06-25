@@ -9853,6 +9853,64 @@ def _manage_hermes_harness() -> None:
                 status = "✗ hermes binary not found"
 
 
+def _manage_kiro_harness() -> None:
+    """Run the level-2 loop for Kiro: ensure the CLI is installed and signed in.
+
+    Kiro owns its own auth via ``kiro-cli login`` (Builder ID / social login /
+    Identity Center) and is installed via Kiro's curl installer — Omnigent stores
+    no Kiro credential. A missing CLI gates the drill-in; when installed, the
+    drill-in offers to launch ``kiro-cli login`` to sign in. Mirrors
+    :func:`_manage_hermes_harness`.
+
+    :returns: None. Side effects: may launch ``kiro-cli login``.
+    """
+    from omnigent.onboarding.harness_install import (
+        KIRO_KEY,
+        harness_cli_installed,
+        harness_install_spec,
+    )
+    from omnigent.onboarding.interactive import console, select
+
+    if not harness_cli_installed(KIRO_KEY):
+        spec = harness_install_spec(KIRO_KEY)
+        hint = (
+            spec.install_hint
+            if spec and spec.install_hint
+            else "curl -fsSL https://cli.kiro.dev/install | bash"
+        )
+        console.print(
+            f"  Kiro isn't installed. Install it with:\n    [bold]{hint}[/bold]\n"
+            "  then re-open this menu."
+        )
+        return
+
+    status: str | None = None
+    while True:
+        rows: list[_HarnessMenuRow] = [
+            _HarnessMenuRow("Run kiro-cli login (sign in)", action="login"),
+            _HarnessMenuRow("← Back", action="back"),
+        ]
+        idx = select(
+            "Kiro",
+            [r.label for r in rows],
+            clear_on_exit=True,
+            status=status,
+        )
+        if idx < 0:
+            return
+        action = rows[idx].action
+        if action == "back":
+            return
+        if action == "login":
+            import subprocess
+
+            try:
+                subprocess.run(["kiro-cli", "login"], check=False)
+                status = "✓ kiro-cli login completed"
+            except FileNotFoundError:
+                status = "✗ kiro-cli binary not found"
+
+
 def _prompt_install_copilot() -> str | None:
     """Offer to install the missing ``copilot`` extra; return a status line.
 
@@ -10572,6 +10630,7 @@ def _run_configure_harnesses_interactive() -> None:
         CURSOR_KEY,
         GOOSE_KEY,
         HERMES_KEY,
+        KIRO_KEY,
         OPENCODE_KEY,
         QWEN_KEY,
         harness_cli_installed,
@@ -10632,6 +10691,10 @@ def _run_configure_harnesses_interactive() -> None:
     # Sentinel marking the Hermes row — like Goose it owns its own auth via
     # ``hermes model`` and is installed via a curl installer.
     _HERMES = "\x00hermes"
+    # Sentinel marking the Kiro row — like Goose/Hermes it owns its own auth (via
+    # ``kiro-cli login``) and is installed via Kiro's curl installer, so it
+    # dispatches to its own drill-in rather than a provider family.
+    _KIRO = "\x00kiro"
     families = [ANTHROPIC_FAMILY, OPENAI_FAMILY, PI_SURFACE]
     while True:
         config = _load_global_config()
@@ -10873,6 +10936,27 @@ def _run_configure_harnesses_interactive() -> None:
         options.append(f"  {hermes_sub}")
         selectable.append(False)
         row_target.append(None)
+        # Kiro — native kiro-cli TUI (own auth via `kiro-cli login`, installed via
+        # Kiro's curl installer — no npm package or Omnigent credential).
+        kiro_installed = harness_cli_installed(KIRO_KEY)
+        options.append(f"{'  ' if kiro_installed else '[red]✗[/] '}Kiro")
+        selectable.append(True)
+        row_target.append(_KIRO)
+        if not kiro_installed:
+            from rich.markup import escape as _rich_escape
+
+            kiro_spec = harness_install_spec(KIRO_KEY)
+            kiro_hint = _rich_escape(
+                kiro_spec.install_hint
+                if kiro_spec and kiro_spec.install_hint
+                else "curl -fsSL https://cli.kiro.dev/install | bash"
+            )
+            kiro_sub = f"[dim]not installed — open to install ({kiro_hint})[/]"
+        else:
+            kiro_sub = "[green]✓[/] installed — sign in with `kiro-cli login`"
+        options.append(f"  {kiro_sub}")
+        selectable.append(False)
+        row_target.append(None)
         options.append("Quit")
         selectable.append(True)
         row_target.append(_QUIT)
@@ -10901,6 +10985,8 @@ def _run_configure_harnesses_interactive() -> None:
             _manage_goose_harness()
         elif target == _HERMES:
             _manage_hermes_harness()
+        elif target == _KIRO:
+            _manage_kiro_harness()
         else:  # Quit row (or, defensively, a non-family row)
             return
 
