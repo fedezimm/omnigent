@@ -1,0 +1,527 @@
+# When a PR merges, decide whether it needs a user-facing docs update and, if so,
+# draft that update as a PR to omnigent-ai/omnigent-site — tagging the original
+# PR author as reviewer.
+#
+# Flow (one self-contained workflow):
+#   merged PR ─▶ plan ─▶ classify (doc-classifier) ─▶ label needs/no-doc-update
+#                                  └▶ if needs-doc ─▶ draft (doc-drafter, with a
+#                                     checkout of omnigent-site) ─▶ open site PR
+#
+# Trigger semantics (per design):
+#   - needs-doc-update applied PRE-merge  -> drafts on merge (the `closed` event).
+#   - needs-doc-update applied POST-merge  -> drafts at apply time (`labeled` event).
+#   - unlabeled at merge                   -> the AI classifies and labels; if
+#                                             needs-doc it also drafts in the same run.
+#   - no-doc-update present                -> nothing to do.
+#
+# Tokens: omnigent labels/comments use GITHUB_TOKEN (applying a label with it does
+# NOT recursively trigger this workflow, which is why classify+draft live in ONE
+# workflow). The cross-repo omnigent-site PR uses a token minted from the existing
+# `omnigent-ci` App, scoped to omnigent-site — which requires the App's install to
+# include omnigent-site (one-time; see docs/OMNIGENT_BOT_SETUP.md).
+#
+# Safety: pull_request_target runs in the trusted base-repo context. We check out
+# the trusted DEFAULT branch and read the PR diff via the API; PR-authored code is
+# never executed.
+name: Doc sync
+
+on:
+  pull_request_target:
+    types: [closed, labeled]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: "PR number to classify/draft (manual test)."
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write  # labels + PR comments are served by the issues API
+
+concurrency:
+  group: doc-sync-${{ github.event.pull_request.number || inputs.pr }}
+  cancel-in-progress: false
+
+env:
+  CODE_REPO: omnigent-ai/omnigent
+  SITE_REPO_SLUG: omnigent-ai/omnigent-site
+  OMNIGENT_SKIP_WEB_UI: "true"
+  UV_INDEX_URL: https://pypi.org/simple
+  PIP_INDEX_URL: https://pypi.org/simple
+
+jobs:
+  doc-sync:
+    name: Classify and draft docs
+    # Cheap pre-gate; the `plan` step refines (e.g. a no-doc-labeled merge → no-op).
+    if: >-
+      github.repository == 'omnigent-ai/omnigent' && (
+        github.event_name == 'workflow_dispatch' ||
+        (
+          github.event.pull_request.merged == true && (
+            github.event.action == 'closed' ||
+            (github.event.action == 'labeled' && github.event.label.name == 'needs-doc-update')
+          )
+        )
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      # --- Plan: resolve PR + decide classify-vs-draft-vs-skip from the event ---
+      - name: Plan
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_PR: ${{ inputs.pr }}
+        run: |
+          set -euo pipefail
+          python3 -u <<'PYEOF'
+          import json, os, subprocess
+          NEEDS, NO = "needs-doc-update", "no-doc-update"
+          event = os.environ.get("GITHUB_EVENT_NAME", "")
+          payload = json.load(open(os.environ["GITHUB_EVENT_PATH"]))
+          classify = predraft = False
+          pr = author = title = ""
+
+          if event == "workflow_dispatch":
+              pr = os.environ.get("INPUT_PR", "").strip()
+              meta = json.loads(subprocess.run(
+                  ["gh", "pr", "view", pr, "--repo", os.environ["CODE_REPO"],
+                   "--json", "author,title"], capture_output=True, text=True).stdout or "{}")
+              author = (meta.get("author") or {}).get("login", "")
+              title = meta.get("title", "")
+              classify = True  # manual test: classify, and draft if needs-doc
+          elif event == "pull_request_target":
+              prj = payload["pull_request"]
+              pr = str(prj["number"]); author = (prj.get("user") or {}).get("login", "")
+              title = prj.get("title", "")
+              merged = bool(prj.get("merged"))
+              labels = [l["name"] for l in prj.get("labels", [])]
+              action = payload.get("action")
+              if not merged:
+                  pass
+              elif action == "labeled":
+                  if (payload.get("label") or {}).get("name") == NEEDS:
+                      predraft = True            # post-merge label → draft now
+              elif action == "closed":
+                  if NEEDS in labels:
+                      predraft = True            # pre-merge needs-doc → draft on merge
+                  elif NO in labels:
+                      pass                       # already decided: no docs
+                  else:
+                      classify = True            # unlabeled → classify
+
+          proceed = classify or predraft
+          out = os.environ["GITHUB_OUTPUT"]
+          with open(out, "a") as fh:
+              fh.write(f"pr={pr}\n")
+              fh.write(f"author={author}\n")
+              fh.write(f"classify={'true' if classify else 'false'}\n")
+              fh.write(f"predraft={'true' if predraft else 'false'}\n")
+              fh.write(f"proceed={'true' if proceed else 'false'}\n")
+          # Title can contain anything → pass via file, not output.
+          open("/tmp/pr_title.txt", "w").write(title)
+          print(f"event={event} pr={pr} author={author} classify={classify} predraft={predraft}")
+          PYEOF
+
+      - name: Check LLM credentials
+        id: creds
+        if: steps.plan.outputs.proceed == 'true'
+        env:
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+        run: |
+          if [ -z "${LLM_API_KEY:-}" ]; then
+            echo "::warning::No LLM credentials — skipping doc sync."
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::add-mask::${LLM_API_KEY}"
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Always check out the TRUSTED default branch (never PR head).
+      - name: Check out omnigent (code)
+        if: steps.plan.outputs.proceed == 'true' && steps.creds.outputs.available == 'true'
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Set up Python
+        if: steps.plan.outputs.proceed == 'true' && steps.creds.outputs.available == 'true'
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version-file: ".python-version"
+
+      - name: Set up uv
+        if: steps.plan.outputs.proceed == 'true' && steps.creds.outputs.available == 'true'
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39  # v8.2.0
+        with:
+          enable-cache: true
+
+      - name: Cache virtualenv
+        if: steps.plan.outputs.proceed == 'true' && steps.creds.outputs.available == 'true'
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v5.0.5
+        with:
+          path: .venv
+          key: venv-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}
+
+      - name: Install dependencies
+        if: steps.plan.outputs.proceed == 'true' && steps.creds.outputs.available == 'true'
+        run: uv sync --extra all --extra dev
+
+      - name: Install Claude Code CLI
+        if: steps.plan.outputs.proceed == 'true' && steps.creds.outputs.available == 'true'
+        env:
+          NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
+        run: |
+          mkdir -p "${GITHUB_WORKSPACE}/.cc-cli" && cd "${GITHUB_WORKSPACE}/.cc-cli"
+          npm install --ignore-scripts --no-audit --no-fund @anthropic-ai/claude-code@2.1.170
+          node node_modules/@anthropic-ai/claude-code/install.cjs
+          echo "${GITHUB_WORKSPACE}/.cc-cli/node_modules/.bin" >> "$GITHUB_PATH"
+
+      - name: Write Omnigent provider config
+        if: steps.plan.outputs.proceed == 'true' && steps.creds.outputs.available == 'true'
+        env:
+          GATEWAY_BASE_URL: ${{ secrets.GATEWAY_BASE_URL }}
+        run: |
+          mkdir -p "$HOME/.omnigent"
+          python3 -c "
+          import pathlib, os, json
+          gw = os.environ['GATEWAY_BASE_URL']
+          cfg = {'providers': {'databricks-gateway': {
+              'kind': 'gateway', 'default': ['anthropic'],
+              'anthropic': {
+                  'base_url': gw + '/anthropic',
+                  'api_key_ref': 'env:LLM_API_KEY',
+                  'models': {'default': 'databricks-claude-opus-4-8'},
+              }}}}
+          pathlib.Path.home().joinpath('.omnigent', 'config.yaml').write_text(json.dumps(cfg, indent=2))
+          "
+
+      # --- Collect the PR diff + metadata once (used by classify and draft) ---
+      - name: Collect PR context
+        id: ctx
+        if: steps.plan.outputs.proceed == 'true' && steps.creds.outputs.available == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.plan.outputs.pr }}
+        run: |
+          set -euo pipefail
+          gh api "repos/${CODE_REPO}/pulls/${PR_NUMBER}" \
+            -H "Accept: application/vnd.github.v3.diff" \
+            | head -c 524288 > /tmp/pr_diff.txt || true
+          gh pr view "$PR_NUMBER" --repo "$CODE_REPO" \
+            --json title,body,files,additions,deletions,changedFiles > /tmp/pr_meta.json
+
+      - name: Classify
+        id: classify
+        if: steps.plan.outputs.classify == 'true' && steps.creds.outputs.available == 'true'
+        env:
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+        run: |
+          set -euo pipefail
+          python3 -u <<'PYEOF'
+          import json, pathlib
+          meta = json.loads(pathlib.Path("/tmp/pr_meta.json").read_text())
+          diff = pathlib.Path("/tmp/pr_diff.txt").read_text(encoding="utf-8", errors="replace")
+          files = "\n".join(f"- {f['path']} (+{f['additions']}/-{f['deletions']})"
+                            for f in meta.get("files", [])[:200])
+          body = (meta.get("body") or "")[:4000]
+          prompt = f"""A pull request just merged. Classify its documentation impact per your instructions.
+
+          ## PR
+          - Title: {meta['title']}
+          - Stats: +{meta['additions']}/-{meta['deletions']} across {meta['changedFiles']} file(s)
+
+          ## Description
+          {body if body else '(no description)'}
+
+          ## Changed files
+          {files if files else '(none reported)'}
+
+          ## Diff
+          ```diff
+          {diff}
+          ```
+
+          Output ONLY the DOC_VERDICT and DOC_REASON lines."""
+          pathlib.Path("/tmp/classify_prompt.txt").write_text(prompt)
+          PYEOF
+          prompt="$(cat /tmp/classify_prompt.txt)"
+          uv run omnigent run .github/agents/doc-classifier \
+            -p "$prompt" --no-session 2>classify-stderr.log | tee /tmp/classify_out.txt \
+            || { echo "::warning::classifier exited non-zero"; cat classify-stderr.log; }
+          python3 - <<'PYEOF'
+          import re, os, pathlib
+          raw = pathlib.Path("/tmp/classify_out.txt").read_text()
+          mv = re.search(r"DOC_VERDICT:\s*(needs-doc-update|no-doc-update)", raw)
+          mr = re.search(r"DOC_REASON:\s*(.+)", raw)
+          verdict = mv.group(1) if mv else ""
+          reason = (mr.group(1).strip() if mr else "")[:300] or "(no reason provided)"
+          pathlib.Path("/tmp/doc_reason.txt").write_text(reason)
+          with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+              fh.write(f"verdict={verdict}\n")
+          print(f"verdict={verdict!r}")
+          PYEOF
+
+      - name: Scan classifier output for secrets
+        if: steps.classify.outcome == 'success'
+        env:
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -n "${LLM_API_KEY:-}" ] && grep -qF "$LLM_API_KEY" /tmp/classify_out.txt 2>/dev/null; then
+            echo "::error::Classifier output contains LLM_API_KEY — aborting."
+            exit 1
+          fi
+
+      # --- Decide final action (draft? which label to apply?) ---
+      - name: Decide
+        id: decide
+        if: steps.plan.outputs.proceed == 'true' && steps.creds.outputs.available == 'true'
+        env:
+          PREDRAFT: ${{ steps.plan.outputs.predraft }}
+          DO_CLASSIFY: ${{ steps.plan.outputs.classify }}
+          VERDICT: ${{ steps.classify.outputs.verdict }}
+        run: |
+          set -euo pipefail
+          draft=false; label=none
+          if [ "${PREDRAFT}" = "true" ]; then
+            draft=true; label=none                 # already labeled needs-doc
+          elif [ "${DO_CLASSIFY}" = "true" ]; then
+            case "${VERDICT}" in
+              needs-doc-update) draft=true;  label=needs-doc-update ;;
+              no-doc-update)    draft=false; label=no-doc-update ;;
+              *)                draft=false; label=none ;;     # unparseable
+            esac
+          fi
+          echo "draft=$draft" >> "$GITHUB_OUTPUT"
+          echo "label=$label" >> "$GITHUB_OUTPUT"
+          echo "::notice::decision draft=$draft label=$label"
+
+      - name: Apply label and comment
+        if: steps.decide.outputs.label == 'needs-doc-update' || steps.decide.outputs.label == 'no-doc-update'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.plan.outputs.pr }}
+          LABEL: ${{ steps.decide.outputs.label }}
+          RUN_URL: "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        run: |
+          set -euo pipefail
+          gh label create needs-doc-update --repo "$REPO" --color 0E8A16 \
+            --description "Merged PR needs a user-facing docs update" 2>/dev/null || true
+          gh label create no-doc-update --repo "$REPO" --color C5DEF5 \
+            --description "Merged PR does not need a docs update" 2>/dev/null || true
+          gh pr edit "$PR_NUMBER" --repo "$REPO" --add-label "$LABEL"
+          REASON="$(cat /tmp/doc_reason.txt 2>/dev/null || echo '')"
+          {
+            echo "<!-- doc-sync-bot -->"
+            echo "🏷️ **Doc impact: \`$LABEL\`**"
+            echo ""
+            echo "$REASON"
+            if [ "$LABEL" = "needs-doc-update" ]; then
+              echo ""
+              echo "Drafting a docs PR to \`omnigent-ai/omnigent-site\`…"
+            fi
+            echo ""
+            echo "<sub>Auto-classified on merge. Set the label manually before merging to override. · [run](${RUN_URL})</sub>"
+          } > /tmp/label_comment.md
+          gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file /tmp/label_comment.md
+
+      # --- Draft path: only when a doc update is needed ---
+      - name: Mint omnigent-site App token
+        id: site-token
+        if: steps.decide.outputs.draft == 'true' && vars.OMNIGENT_BOT_APP_ID != ''
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1  # v3.2.0
+        with:
+          app-id: ${{ vars.OMNIGENT_BOT_APP_ID }}
+          private-key: ${{ secrets.OMNIGENT_BOT_APP_KEY }}
+          owner: omnigent-ai
+          repositories: omnigent-site
+
+      - name: Check out omnigent-site (docs)
+        if: steps.decide.outputs.draft == 'true'
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          repository: omnigent-ai/omnigent-site
+          path: omnigent-site
+          token: ${{ steps.site-token.outputs.token || github.token }}
+          persist-credentials: false
+
+      - name: Build drafter prompt
+        if: steps.decide.outputs.draft == 'true'
+        env:
+          PR_NUMBER: ${{ steps.plan.outputs.pr }}
+        run: |
+          set -euo pipefail
+          python3 -u <<'PYEOF'
+          import json, os, pathlib
+          ws = os.environ["GITHUB_WORKSPACE"]
+          meta = json.loads(pathlib.Path("/tmp/pr_meta.json").read_text())
+          diff = pathlib.Path("/tmp/pr_diff.txt").read_text(encoding="utf-8", errors="replace")
+          body = (meta.get("body") or "")[:4000]
+          prompt = f"""OMNIGENT_REPO={ws}
+          SITE_REPO={ws}/omnigent-site
+          PR_NUMBER={os.environ['PR_NUMBER']}
+          PR_TITLE={meta['title']}
+
+          The merged PR's description and diff follow. Draft the omnigent-site docs
+          update per your instructions, then print the DOC_DRAFT_SUMMARY block.
+
+          ## Description
+          {body if body else '(no description)'}
+
+          ## Diff
+          ```diff
+          {diff}
+          ```
+          """
+          pathlib.Path("/tmp/draft_prompt.txt").write_text(prompt)
+          PYEOF
+
+      - name: Run drafter
+        id: draft
+        if: steps.decide.outputs.draft == 'true'
+        working-directory: omnigent-site
+        env:
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+        run: |
+          set -euo pipefail
+          prompt="$(cat /tmp/draft_prompt.txt)"
+          uv run --project "${GITHUB_WORKSPACE}" omnigent run \
+            "${GITHUB_WORKSPACE}/.github/agents/doc-drafter" \
+            -p "$prompt" --no-session \
+            2>draft-stderr.log | tee /tmp/draft_out.txt \
+            || { echo "::warning::drafter exited non-zero"; cat draft-stderr.log; }
+
+      - name: Scan drafter output for secrets
+        if: steps.decide.outputs.draft == 'true'
+        env:
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -n "${LLM_API_KEY:-}" ] && grep -qF "$LLM_API_KEY" /tmp/draft_out.txt 2>/dev/null; then
+            echo "::error::Drafter output contains LLM_API_KEY — aborting before opening a PR."
+            exit 1
+          fi
+
+      - name: Detect doc changes
+        id: sitechanges
+        if: steps.decide.outputs.draft == 'true'
+        working-directory: omnigent-site
+        run: |
+          set -euo pipefail
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::Drafter produced no doc changes."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build site PR body and resolve reviewer
+        id: sitepr
+        if: steps.sitechanges.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ steps.site-token.outputs.token || github.token }}
+          AUTHOR: ${{ steps.plan.outputs.author }}
+          PR_NUMBER: ${{ steps.plan.outputs.pr }}
+        run: |
+          set -euo pipefail
+          python3 -u <<'PYEOF'
+          import os, re, json, subprocess, pathlib
+          site = os.environ["SITE_REPO_SLUG"]; code = os.environ["CODE_REPO"]
+          author = os.environ.get("AUTHOR", ""); pr = os.environ["PR_NUMBER"]
+          title = pathlib.Path("/tmp/pr_title.txt").read_text().strip()
+          raw = pathlib.Path("/tmp/draft_out.txt").read_text()
+          m = re.search(r"<!--\s*DOC_DRAFT_SUMMARY\s*-->", raw)
+          summary = raw[m.end():].strip() if m else "_(drafter produced edits but no summary)_"
+
+          # Tag the source-PR author: request review if they're a site collaborator,
+          # else @-mention. Skip bots / the CI identity.
+          reviewer = ""; mention = ""
+          if author and not author.endswith("[bot]") and author != "omnigent-ci":
+              r = subprocess.run(["gh", "api", f"repos/{site}/collaborators/{author}", "--silent"],
+                                 capture_output=True, text=True)
+              if r.returncode == 0:
+                  reviewer = author
+              else:
+                  mention = f"@{author}"
+
+          body = f"""<!-- doc-sync -->
+          Documentation update for **{code}#{pr}** — {title}
+
+          {summary}
+
+          ---
+          Source PR: {code}#{pr}{(' · author ' + mention) if mention else ''}
+          <sub>Drafted automatically by the doc-sync workflow. Review for accuracy before merging.</sub>
+          """
+          body = "\n".join(l[10:] if l.startswith(" "*10) else l for l in body.splitlines())
+          pathlib.Path("/tmp/site_pr_body.md").write_text(body)
+          with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+              fh.write(f"reviewer={reviewer}\n")
+          print(f"reviewer={reviewer!r} mention={mention!r}")
+          PYEOF
+
+      - name: Open or update site PR
+        if: steps.sitechanges.outputs.changed == 'true' && steps.site-token.outputs.token != ''
+        working-directory: omnigent-site
+        env:
+          GH_TOKEN: ${{ steps.site-token.outputs.token }}
+          SITE_TOKEN: ${{ steps.site-token.outputs.token }}
+          PR_NUMBER: ${{ steps.plan.outputs.pr }}
+          REVIEWER: ${{ steps.sitepr.outputs.reviewer }}
+        run: |
+          set -euo pipefail
+          BRANCH="auto/docs/pr-${PR_NUMBER}"
+          git config user.name  "omnigent-ci[bot]"
+          git config user.email "294685417+omnigent-ci[bot]@users.noreply.github.com"
+          git checkout -B "$BRANCH"
+          git add -A
+          git commit -m "docs: document ${CODE_REPO}#${PR_NUMBER}"
+          git push --force-with-lease \
+            "https://x-access-token:${SITE_TOKEN}@github.com/${SITE_REPO_SLUG}.git" "$BRANCH"
+
+          REVIEWER_ARG=()
+          [ -n "${REVIEWER}" ] && REVIEWER_ARG=(--reviewer "${REVIEWER}")
+          EXISTING="$(gh pr list --repo "$SITE_REPO_SLUG" --head "$BRANCH" --state open \
+              --json number --jq '.[0].number // empty' 2>/dev/null || true)"
+          if [ -n "$EXISTING" ]; then
+            gh pr edit "$EXISTING" --repo "$SITE_REPO_SLUG" --body-file /tmp/site_pr_body.md || true
+            [ -n "${REVIEWER}" ] && gh pr edit "$EXISTING" --repo "$SITE_REPO_SLUG" --add-reviewer "${REVIEWER}" || true
+            echo "Updated site PR #$EXISTING."
+          else
+            gh label create automated-docs --repo "$SITE_REPO_SLUG" --color 0E8A16 \
+              --description "Automated documentation update" 2>/dev/null || true
+            if gh pr create --repo "$SITE_REPO_SLUG" --base main --head "$BRANCH" \
+                --title "docs: document ${CODE_REPO}#${PR_NUMBER}" \
+                --label automated-docs --body-file /tmp/site_pr_body.md "${REVIEWER_ARG[@]}"; then
+              echo "Opened site PR for $BRANCH."
+            else
+              echo "::warning::Could not open the site PR automatically. Branch '$BRANCH' is pushed."
+            fi
+          fi
+
+      - name: Note draft skipped (no site token)
+        if: steps.sitechanges.outputs.changed == 'true' && steps.site-token.outputs.token == ''
+        run: |
+          echo "::warning::Doc edits were drafted but no omnigent-site token is available"
+          echo "(extend the omnigent-ci App's install to omnigent-site). The PR was not opened."
+          echo "### Doc-sync: drafted but not pushed" >> "$GITHUB_STEP_SUMMARY"
+          { echo '```diff'; (cd omnigent-site && git --no-pager diff); echo '```'; } >> "$GITHUB_STEP_SUMMARY" || true
+
+      - name: Upload logs on failure
+        if: always() && steps.plan.outputs.proceed == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: doc-sync-${{ steps.plan.outputs.pr }}-${{ github.run_id }}
+          path: |
+            classify-stderr.log
+            draft-stderr.log
+            /tmp/classify_out.txt
+            /tmp/draft_out.txt
+            /tmp/site_pr_body.md
+          retention-days: 7
+          if-no-files-found: ignore
