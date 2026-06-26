@@ -18,11 +18,17 @@
 # NOT recursively trigger this workflow, which is why classify+draft live in ONE
 # workflow). The cross-repo omnigent-site PR uses a token minted from the existing
 # `omnigent-ci` App, scoped to omnigent-site — which requires the App's install to
-# include omnigent-site (one-time; see docs/OMNIGENT_BOT_SETUP.md).
+# include omnigent-site (one-time; see docs/OMNIGENT_BOT_SETUP.md). When the App
+# isn't configured the draft still runs and prints its diff to the run summary but
+# does not push — this fail-open relies on omnigent-site being PUBLIC so the
+# github.token fallback can read it; if it ever goes private, the checkout (read)
+# needs the App token too.
 #
 # Safety: pull_request_target runs in the trusted base-repo context. We check out
 # the trusted DEFAULT branch and read the PR diff via the API; PR-authored code is
-# never executed.
+# never executed. The drafter runs under a network-denying sandbox (see
+# .github/agents/doc-drafter/config.yaml) so an injected diff can't exfiltrate the
+# LLM key, and drafted file content is scanned for the key before any push.
 name: Doc sync
 
 on:
@@ -211,6 +217,12 @@ jobs:
           gh api "repos/${CODE_REPO}/pulls/${PR_NUMBER}" \
             -H "Accept: application/vnd.github.v3.diff" \
             | head -c 524288 > /tmp/pr_diff.txt || true
+          # Record whether the diff hit the 512 KB cap so the prompts can say so.
+          if [ "$(wc -c < /tmp/pr_diff.txt)" -ge 524288 ]; then
+            echo true > /tmp/diff_truncated
+          else
+            echo false > /tmp/diff_truncated
+          fi
           gh pr view "$PR_NUMBER" --repo "$CODE_REPO" \
             --json title,body,files,additions,deletions,changedFiles > /tmp/pr_meta.json
 
@@ -225,6 +237,9 @@ jobs:
           import json, pathlib
           meta = json.loads(pathlib.Path("/tmp/pr_meta.json").read_text())
           diff = pathlib.Path("/tmp/pr_diff.txt").read_text(encoding="utf-8", errors="replace")
+          truncated = pathlib.Path("/tmp/diff_truncated").read_text().strip() == "true"
+          trunc_note = ("\n> NOTE: the diff was truncated at 512 KB — you are seeing only part of it. "
+                        "If the visible portion is inconclusive, lean toward needs-doc-update.\n" if truncated else "")
           files = "\n".join(f"- {f['path']} (+{f['additions']}/-{f['deletions']})"
                             for f in meta.get("files", [])[:200])
           body = (meta.get("body") or "")[:4000]
@@ -233,7 +248,7 @@ jobs:
           ## PR
           - Title: {meta['title']}
           - Stats: +{meta['additions']}/-{meta['deletions']} across {meta['changedFiles']} file(s)
-
+          {trunc_note}
           ## Description
           {body if body else '(no description)'}
 
@@ -286,19 +301,20 @@ jobs:
           VERDICT: ${{ steps.classify.outputs.verdict }}
         run: |
           set -euo pipefail
-          draft=false; label=none
+          draft=false; label=none; failed=false
           if [ "${PREDRAFT}" = "true" ]; then
             draft=true; label=none                 # already labeled needs-doc
           elif [ "${DO_CLASSIFY}" = "true" ]; then
             case "${VERDICT}" in
               needs-doc-update) draft=true;  label=needs-doc-update ;;
               no-doc-update)    draft=false; label=no-doc-update ;;
-              *)                draft=false; label=none ;;     # unparseable
+              *)                draft=false; label=none; failed=true ;;  # no parseable verdict
             esac
           fi
           echo "draft=$draft" >> "$GITHUB_OUTPUT"
           echo "label=$label" >> "$GITHUB_OUTPUT"
-          echo "::notice::decision draft=$draft label=$label"
+          echo "failed=$failed" >> "$GITHUB_OUTPUT"
+          echo "::notice::decision draft=$draft label=$label failed=$failed"
 
       - name: Apply label and comment
         if: steps.decide.outputs.label == 'needs-doc-update' || steps.decide.outputs.label == 'no-doc-update'
@@ -330,6 +346,26 @@ jobs:
           } > /tmp/label_comment.md
           gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file /tmp/label_comment.md
 
+      # If the classifier produced no parseable verdict, don't leave the PR in
+      # limbo (the `closed` event won't re-fire): ask for a manual label. Adding
+      # `needs-doc-update` later re-triggers via the `labeled` event.
+      - name: Request manual label on classifier failure
+        if: steps.decide.outputs.failed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.plan.outputs.pr }}
+          RUN_URL: "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        run: |
+          set -euo pipefail
+          {
+            echo "<!-- doc-sync-bot -->"
+            echo "⚠️ Couldn't auto-classify this PR's documentation impact."
+            echo ""
+            echo "Please add a \`needs-doc-update\` or \`no-doc-update\` label manually — adding \`needs-doc-update\` will trigger the docs draft. · [run](${RUN_URL})"
+          } > /tmp/unclassified_comment.md
+          gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file /tmp/unclassified_comment.md
+
       # --- Draft path: only when a doc update is needed ---
       - name: Mint omnigent-site App token
         id: site-token
@@ -348,7 +384,9 @@ jobs:
           repository: omnigent-ai/omnigent-site
           path: omnigent-site
           token: ${{ steps.site-token.outputs.token || github.token }}
-          persist-credentials: false
+          # Persist the checkout credential so the later `git push` authenticates
+          # via http.extraheader — no token embedded in the push URL.
+          persist-credentials: true
 
       - name: Build drafter prompt
         if: steps.decide.outputs.draft == 'true'
@@ -361,15 +399,18 @@ jobs:
           ws = os.environ["GITHUB_WORKSPACE"]
           meta = json.loads(pathlib.Path("/tmp/pr_meta.json").read_text())
           diff = pathlib.Path("/tmp/pr_diff.txt").read_text(encoding="utf-8", errors="replace")
+          truncated = pathlib.Path("/tmp/diff_truncated").read_text().strip() == "true"
+          trunc_note = ("\n> NOTE: the diff was truncated at 512 KB — document only what the visible "
+                        "portion supports and flag the rest for manual review.\n" if truncated else "")
           body = (meta.get("body") or "")[:4000]
-          prompt = f"""OMNIGENT_REPO={ws}
-          SITE_REPO={ws}/omnigent-site
+          prompt = f"""SITE_REPO={ws}/omnigent-site
           PR_NUMBER={os.environ['PR_NUMBER']}
           PR_TITLE={meta['title']}
 
-          The merged PR's description and diff follow. Draft the omnigent-site docs
-          update per your instructions, then print the DOC_DRAFT_SUMMARY block.
-
+          The merged PR's description and diff follow — that diff is your source of
+          truth. Draft the omnigent-site docs update per your instructions, then
+          print the DOC_DRAFT_SUMMARY block.
+          {trunc_note}
           ## Description
           {body if body else '(no description)'}
 
@@ -384,7 +425,9 @@ jobs:
       - name: Run drafter
         id: draft
         if: steps.decide.outputs.draft == 'true'
-        working-directory: omnigent-site
+        # cwd = the workspace root (NOT omnigent-site): the sandbox needs the
+        # omnigent venv/interpreter inside cwd to launch its os_env helper. Writes
+        # are confined to the omnigent-site subdir by the agent's sandbox spec.
         env:
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
         run: |
@@ -418,6 +461,24 @@ jobs:
           else
             echo "::notice::Drafter produced no doc changes."
             echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Scan drafted changes for secrets
+        if: steps.sitechanges.outputs.changed == 'true'
+        working-directory: omnigent-site
+        env:
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+        run: |
+          set -euo pipefail
+          # Defense in depth: a prompt-injected drafter could write the key INTO a
+          # doc file (the output-text scan wouldn't catch that). Scan the actual
+          # drafted content — tracked changes + new files — before it can be pushed.
+          if [ -n "${LLM_API_KEY:-}" ]; then
+            leaked="$({ git diff HEAD; git ls-files --others --exclude-standard -z | xargs -0 cat 2>/dev/null; } | grep -F "$LLM_API_KEY" || true)"
+            if [ -n "$leaked" ]; then
+              echo "::error::Drafted doc changes contain LLM_API_KEY — aborting before commit/push."
+              exit 1
+            fi
           fi
 
       - name: Build site PR body and resolve reviewer
@@ -470,7 +531,6 @@ jobs:
         working-directory: omnigent-site
         env:
           GH_TOKEN: ${{ steps.site-token.outputs.token }}
-          SITE_TOKEN: ${{ steps.site-token.outputs.token }}
           PR_NUMBER: ${{ steps.plan.outputs.pr }}
           REVIEWER: ${{ steps.sitepr.outputs.reviewer }}
         run: |
@@ -478,11 +538,28 @@ jobs:
           BRANCH="auto/docs/pr-${PR_NUMBER}"
           git config user.name  "omnigent-ci[bot]"
           git config user.email "294685417+omnigent-ci[bot]@users.noreply.github.com"
+
+          # Don't clobber human edits: if the rolling branch already exists with a
+          # HEAD commit by someone other than the bot, leave it as-is.
+          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+            git fetch --depth=1 origin "$BRANCH" >/dev/null 2>&1 || true
+            LAST_AUTHOR="$(git log -1 --format='%ae' FETCH_HEAD 2>/dev/null || echo '')"
+            if [ -n "$LAST_AUTHOR" ] && [ "$LAST_AUTHOR" != "294685417+omnigent-ci[bot]@users.noreply.github.com" ]; then
+              echo "::warning::$BRANCH has manual commits ($LAST_AUTHOR) — skipping auto-redraft."
+              SITE_PR="$(gh pr list --repo "$SITE_REPO_SLUG" --head "$BRANCH" --state open --json number --jq '.[0].number // empty' 2>/dev/null || true)"
+              [ -n "$SITE_PR" ] && gh pr comment "$SITE_PR" --repo "$SITE_REPO_SLUG" \
+                --body "doc-sync: detected manual edits on this branch — skipping the automated re-draft for ${CODE_REPO}#${PR_NUMBER}." || true
+              exit 0
+            fi
+          fi
+
           git checkout -B "$BRANCH"
           git add -A
           git commit -m "docs: document ${CODE_REPO}#${PR_NUMBER}"
-          git push --force-with-lease \
-            "https://x-access-token:${SITE_TOKEN}@github.com/${SITE_REPO_SLUG}.git" "$BRANCH"
+          # Push via the credential persisted by actions/checkout (http.extraheader) —
+          # no token in the push URL. --force is safe here: the guard above ensured
+          # the branch carries only bot commits.
+          git push --force origin "$BRANCH"
 
           REVIEWER_ARG=()
           [ -n "${REVIEWER}" ] && REVIEWER_ARG=(--reviewer "${REVIEWER}")

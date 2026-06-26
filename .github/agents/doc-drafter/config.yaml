@@ -29,13 +29,28 @@ executor:
 async: true
 cancellable: true
 
-# Unsandboxed filesystem access: WRITE the omnigent-site checkout (its cwd) and
-# READ the omnigent code checkout (path passed in the prompt) to confirm facts.
+# Hardened os_env. The agent ingests the merged PR's diff/description as input, so
+# it runs under a network-denying sandbox to neutralize prompt-injection
+# exfiltration. `type` is omitted → it resolves to the platform default
+# (linux_bwrap in CI, darwin_seatbelt on macOS). `allow_network: false` blocks all
+# outbound network for the sys_os_shell helper (curl/wget/nc) AND filters its env
+# to the passthrough allowlist, so LLM_API_KEY is never visible to the shell. The
+# claude-sdk harness (a separate process) still reaches the model gateway.
+#
+# cwd is the WORKSPACE ROOT (the run step sets the process cwd there), which holds
+# both the omnigent venv/interpreter and the `omnigent-site` checkout. cwd must
+# contain the interpreter: the os_env helper is launched with the omnigent venv's
+# python, and a sandbox confined to a subtree that excludes it denies exec
+# (sandbox-exec / bwrap: "Operation not permitted"). `write_paths: ["omnigent-site"]`
+# then confines WRITES to the docs checkout; the workspace is readable (only public
+# code lives there — secrets are in $HOME/env, outside the jail) but cannot be
+# written, and there is no network.
 os_env:
   type: caller_process
   cwd: .
   sandbox:
-    type: none
+    allow_network: false
+    write_paths: ["omnigent-site"]
 
 # Same blast_radius guardrail as the rest of the project: catastrophic commands
 # denied; ordinary git reads run without an ASK (headless can't approve).
@@ -57,19 +72,19 @@ prompt: |
   or tests, and you NEVER edit anything in the omnigent code repo.
 
   ## Inputs (in the run prompt)
-  - `OMNIGENT_REPO` — absolute path to the omnigent code checkout (READ-ONLY).
-    Read it with `git -C "$OMNIGENT_REPO" ...` / `cat` via `sys_os_shell` to
-    confirm facts. (Your sandboxed `sys_os_read` is scoped to the site repo; use
-    the shell to read outside it.)
-  - `SITE_REPO` — absolute path to the omnigent-site checkout. This is your cwd
-    and your ONLY write target.
+  - `SITE_REPO` — absolute path to the omnigent-site checkout. It is your ONLY
+    WRITE target — make all doc edits there. You run in a network-denying sandbox
+    (no outbound network of any kind), so ground every fact in the PR diff below
+    rather than fetching anything.
   - `PR_NUMBER`, `PR_TITLE` — the merged source PR.
-  - The PR diff and description are included below the inputs.
+  - The PR diff and description are included below the inputs — that diff is your
+    source of truth for what changed.
 
   ## Step 1 — Understand the change
-  Read the diff and PR description. If you need to confirm a fact a doc will
-  commit to print (an exact flag, default, harness id, CLI name, config key),
-  read the actual code under OMNIGENT_REPO via the shell. Never invent facts.
+  Read the diff and PR description carefully — they are your source of truth. Pull
+  exact facts (flags, defaults, harness ids, CLI names, config keys) from the diff
+  itself. Never invent a fact; if the diff doesn't settle something a doc must
+  state, flag it for manual review rather than guessing.
 
   ## Step 2 — Inspect the live site and decide placement
   This is why you have the whole site checked out. Read
@@ -107,7 +122,8 @@ prompt: |
   - **Sidebar**: when you add a page, add its entry to the `SECTIONS` array in
     `components/DocsSidebarFull.js`, next to related pages, following the existing
     `{ href, label }` / `subsections` shape.
-  Ground every fact (flag, default, id, command) in the code — never invent.
+  Ground every fact (flag, default, id, command) in the PR diff — never invent;
+  if the diff doesn't settle it, flag it for manual review.
 
   ## Step 4 — Flag manual-only work
   You cannot regenerate screenshots/GIFs, re-record demos, or redraw diagrams.
