@@ -695,7 +695,13 @@ class CodexNativeAppServer:
             argv.extend(["-c", override])
         self.process_owner_lock = acquire_codex_native_process_owner_lock()
         try:
-            self.proc = await asyncio.create_subprocess_exec(
+            # Spawn through the module-level ``_create_subprocess_exec``
+            # indirection (a transparent passthrough to
+            # ``asyncio.create_subprocess_exec``) so tests can stub the spawn
+            # by patching that name — patching ``…app_server.asyncio.\
+            # create_subprocess_exec`` would walk into the real asyncio
+            # singleton and leak the mock across the process.
+            self.proc = await _create_subprocess_exec(
                 *argv,
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.DEVNULL,

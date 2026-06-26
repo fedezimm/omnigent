@@ -975,13 +975,19 @@ def _patch_start_spawn(monkeypatch: pytest.MonkeyPatch, recorder: _SpawnRecorder
     subprocess spawn never reaches the recorder. The recorder is wired only
     to the final app-server spawn.
 
+    The spawn is captured by patching the module-level
+    ``_create_subprocess_exec`` indirection (which ``start`` now calls),
+    NOT ``…app_server.asyncio.create_subprocess_exec`` — the latter walks the
+    real asyncio module singleton and leaks the mock into every other test in
+    the process.
+
     :param monkeypatch: Pytest monkeypatch fixture.
     :param recorder: Recorder whose ``_record`` captures the spawn argv/env.
     """
     _disable_codex_startup_rpc(monkeypatch)
     _set_codex_version(monkeypatch, (0, 100, 0))
     monkeypatch.setattr(
-        "omnigent.codex_native_app_server.asyncio.create_subprocess_exec", recorder._record
+        "omnigent.codex_native_app_server._create_subprocess_exec", recorder._record
     )
     # The crash-reap registration path (added alongside this flag) is exercised
     # by the process-registry tests; these flag tests only assert argv/env, so
