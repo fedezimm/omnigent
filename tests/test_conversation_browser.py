@@ -10,7 +10,7 @@ import omnigent.conversation_browser as browser
 
 
 @pytest.mark.parametrize(
-    "base_url,expected",
+    "url,expected",
     [
         # Databricks workspace API mount → the recognizable /omnigent SPA URL.
         (
@@ -32,7 +32,7 @@ import omnigent.conversation_browser as browser
         ("https://omnigent-02m5.onrender.com/", "https://omnigent-02m5.onrender.com"),
     ],
 )
-def test_display_server_url_maps_databricks_api_mount(base_url: str, expected: str) -> None:
+def test_display_server_url_maps_databricks_api_mount(url: str, expected: str) -> None:
     """
     ``display_server_url`` rewrites the Databricks API mount to the SPA URL.
 
@@ -43,11 +43,11 @@ def test_display_server_url_maps_databricks_api_mount(base_url: str, expected: s
 
     :returns: None.
     """
-    assert browser.display_server_url(base_url) == expected
+    assert browser.display_server_url(url) == expected
 
 
 @pytest.mark.parametrize(
-    "base_url,expected",
+    "url,expected",
     [
         ("https://ws.databricks.com/api/2.0/omnigent", True),
         ("https://ws.databricks.com/api/2.0/omnigent/", True),
@@ -56,7 +56,7 @@ def test_display_server_url_maps_databricks_api_mount(base_url: str, expected: s
         ("https://omnigent-02m5.onrender.com", False),
     ],
 )
-def test_is_workspace_hosted_url(base_url: str, expected: bool) -> None:
+def test_is_workspace_hosted_url(url: str, expected: bool) -> None:
     """
     ``is_workspace_hosted_url`` is true only for the workspace API mount.
 
@@ -66,7 +66,7 @@ def test_is_workspace_hosted_url(base_url: str, expected: bool) -> None:
 
     :returns: None.
     """
-    assert browser.is_workspace_hosted_url(base_url) is expected
+    assert browser.is_workspace_hosted_url(url) is expected
 
 
 def test_conversation_url_quotes_session_id() -> None:
