@@ -1,0 +1,221 @@
+# TEMPORARY verification workflow — DELETE before merging PR #1269.
+#
+# Proves the doc-drafter's hardened sandbox works on the real CI backend
+# (linux_bwrap), which local macOS testing (darwin_seatbelt) cannot. Two things
+# it confirms:
+#   1. The drafter's sandbox resolves to linux_bwrap with allow_network:false —
+#      NOT a silent `none` fallback (which would happen if bubblewrap is absent,
+#      silently disabling the hardening).
+#   2. The drafter runs end-to-end under bwrap on a real PR diff and still writes
+#      MDX — i.e. the os_env helper interpreter launches (the exact regression
+#      that broke under seatbelt locally: `execvp ... Operation not permitted`).
+#
+# Triggered on push to the feature branch so it runs without needing the
+# workflow on the default branch. Same-repo branch → secrets are available.
+name: _verify doc-sync sandbox (TEMP — delete before merge)
+
+on:
+  push:
+    branches: [doc-changelog-and-update]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-sandbox
+  cancel-in-progress: true
+
+env:
+  OMNIGENT_SKIP_WEB_UI: "true"
+  UV_INDEX_URL: https://pypi.org/simple
+  PIP_INDEX_URL: https://pypi.org/simple
+
+jobs:
+  verify:
+    if: github.repository == 'omnigent-ai/omnigent'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check LLM credentials
+        id: creds
+        env:
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+        run: |
+          if [ -z "${LLM_API_KEY:-}" ]; then
+            echo "::error::No LLM credentials — cannot verify the drafter under bwrap."
+            exit 1
+          fi
+          echo "::add-mask::${LLM_API_KEY}"
+
+      - name: Check out omnigent (this branch)
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Check out omnigent-site (docs)
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          repository: omnigent-ai/omnigent-site
+          path: omnigent-site
+          token: ${{ github.token }}
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version-file: ".python-version"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39  # v8.2.0
+        with:
+          enable-cache: true
+
+      - name: Cache virtualenv
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v5.0.5
+        with:
+          path: .venv
+          key: venv-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}
+
+      - name: Install dependencies
+        run: uv sync --extra all --extra dev
+
+      - name: Install Claude Code CLI
+        env:
+          NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
+        run: |
+          mkdir -p "${GITHUB_WORKSPACE}/.cc-cli" && cd "${GITHUB_WORKSPACE}/.cc-cli"
+          npm install --ignore-scripts --no-audit --no-fund @anthropic-ai/claude-code@2.1.170
+          node node_modules/@anthropic-ai/claude-code/install.cjs
+          echo "${GITHUB_WORKSPACE}/.cc-cli/node_modules/.bin" >> "$GITHUB_PATH"
+
+      - name: Write Omnigent provider config
+        env:
+          GATEWAY_BASE_URL: ${{ secrets.GATEWAY_BASE_URL }}
+        run: |
+          mkdir -p "$HOME/.omnigent"
+          python3 -c "
+          import pathlib, os, json
+          gw = os.environ['GATEWAY_BASE_URL']
+          cfg = {'providers': {'databricks-gateway': {
+              'kind': 'gateway', 'default': ['anthropic'],
+              'anthropic': {
+                  'base_url': gw + '/anthropic',
+                  'api_key_ref': 'env:LLM_API_KEY',
+                  'models': {'default': 'databricks-claude-opus-4-8'},
+              }}}}
+          pathlib.Path.home().joinpath('.omnigent', 'config.yaml').write_text(json.dumps(cfg, indent=2))
+          "
+
+      # --- (0) bubblewrap availability: is the sandbox real or a silent no-op? ---
+      - name: Probe bubblewrap availability
+        id: bwrap
+        run: |
+          set -euo pipefail
+          if command -v bwrap >/dev/null 2>&1; then
+            echo "PREINSTALLED=yes (bwrap at $(command -v bwrap))"
+            echo "preinstalled=yes" >> "$GITHUB_OUTPUT"
+          else
+            echo "PREINSTALLED=no — installing bubblewrap"
+            echo "preinstalled=no" >> "$GITHUB_OUTPUT"
+            sudo apt-get update && sudo apt-get install -y bubblewrap
+          fi
+          echo "bwrap: $(command -v bwrap)"
+          bwrap --version || true
+
+      # --- (1) The drafter's sandbox must resolve to linux_bwrap + net off ---
+      - name: Assert drafter sandbox is active (not 'none')
+        run: |
+          set -euo pipefail
+          uv run --no-sync python - <<'PY'
+          import sys
+          from pathlib import Path
+          from omnigent.inner.sandbox import _default_sandbox_for_platform
+          from omnigent.spec import load
+          print("platform default sandbox:", _default_sandbox_for_platform().type)
+          s = load(Path(".github/agents/doc-drafter"))
+          sb = s.os_env.sandbox
+          print(f"drafter sandbox.type   = {sb.type}")
+          print(f"drafter allow_network  = {sb.allow_network}")
+          print(f"drafter write_paths    = {sb.write_paths}")
+          if sb.type == "none":
+              print("::error::drafter sandbox resolved to 'none' — hardening is a SILENT NO-OP on this runner")
+              sys.exit(1)
+          if sb.allow_network is not False:
+              print("::error::drafter sandbox allows network — egress not blocked")
+              sys.exit(1)
+          print("OK: drafter runs under", sb.type, "with network denied")
+          PY
+
+      # --- (2) Drafter end-to-end under bwrap: interpreter launches + writes MDX ---
+      - name: Build drafter prompt from PR #881 diff
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api "repos/omnigent-ai/omnigent/pulls/881" \
+            -H "Accept: application/vnd.github.v3.diff" | head -c 524288 > /tmp/pr_diff.txt || true
+          gh pr view 881 --repo omnigent-ai/omnigent --json title,body > /tmp/pr_meta.json
+          python3 -u <<'PYEOF'
+          import json, os, pathlib
+          ws = os.environ["GITHUB_WORKSPACE"]
+          meta = json.loads(pathlib.Path("/tmp/pr_meta.json").read_text())
+          diff = pathlib.Path("/tmp/pr_diff.txt").read_text(encoding="utf-8", errors="replace")
+          body = (meta.get("body") or "")[:4000]
+          prompt = f"""SITE_REPO={ws}/omnigent-site
+          PR_NUMBER=881
+          PR_TITLE={meta['title']}
+
+          The merged PR's description and diff follow — that diff is your source of
+          truth. Draft the omnigent-site docs update per your instructions, then
+          print the DOC_DRAFT_SUMMARY block.
+
+          ## Description
+          {body if body else '(no description)'}
+
+          ## Diff
+          ```diff
+          {diff}
+          ```
+          """
+          pathlib.Path("/tmp/draft_prompt.txt").write_text(prompt)
+          print(f"prompt built: {len(prompt)} chars")
+          PYEOF
+
+      - name: Run drafter under bwrap
+        env:
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+        run: |
+          set -euo pipefail
+          prompt="$(cat /tmp/draft_prompt.txt)"
+          uv run --project "${GITHUB_WORKSPACE}" omnigent run \
+            "${GITHUB_WORKSPACE}/.github/agents/doc-drafter" \
+            -p "$prompt" --no-session \
+            2>draft-stderr.log | tee /tmp/draft_out.txt \
+            || { echo "::warning::drafter exited non-zero"; cat draft-stderr.log; }
+
+      - name: Assert the drafter wrote MDX (interpreter launched under bwrap)
+        working-directory: omnigent-site
+        run: |
+          set -euo pipefail
+          echo "=== omnigent-site working-tree changes ==="
+          git --no-pager diff --stat
+          if grep -qiE "execvp|Operation not permitted|os_env helper failed|exit(ed)? .*code 71" /tmp/draft_out.txt ../draft-stderr.log 2>/dev/null; then
+            echo "::error::Found a sandbox helper-launch failure in drafter output — the regression is NOT fixed under bwrap."
+            exit 1
+          fi
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "::error::Drafter produced NO file changes under bwrap — it could not write (sandbox likely broke the helper)."
+            exit 1
+          fi
+          echo "OK: drafter wrote MDX under bwrap — the os_env helper launched and writes succeeded."
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: verify-sandbox-${{ github.run_id }}
+          path: |
+            /tmp/draft_out.txt
+            draft-stderr.log
+          retention-days: 7
+          if-no-files-found: ignore
