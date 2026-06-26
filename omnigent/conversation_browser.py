@@ -16,6 +16,22 @@ WORKSPACE_API_PATH = "/api/2.0/omnigent"
 WORKSPACE_UI_PATH = "/omnigent"
 
 
+def is_workspace_hosted_url(base_url: str) -> bool:
+    """
+    Whether *base_url* is a Databricks workspace-hosted Omnigent mount.
+
+    True for the API proxy mount (``https://<ws>/api/2.0/omnigent``) the
+    CLI connects to on a workspace. Used to suppress UI a workspace
+    deployment shouldn't surface (e.g. the startup banner's server-version
+    row, since a workspace build reports no meaningful version string).
+
+    :param base_url: Omnigent server base URL, e.g.
+        ``"https://example.databricks.com/api/2.0/omnigent"``.
+    :returns: ``True`` when the URL path is the workspace API mount.
+    """
+    return urllib.parse.urlsplit(base_url.rstrip("/")).path == WORKSPACE_API_PATH
+
+
 def display_server_url(base_url: str) -> str:
     """
     Map an Omnigent server base URL to the user-facing form to show.

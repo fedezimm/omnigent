@@ -1540,12 +1540,15 @@ def test_startup_header_shows_local_server_url_with_version() -> None:
 
 
 def test_startup_header_shows_databricks_workspace_url_not_api_mount() -> None:
-    """A Databricks server shows the ``/omnigent`` SPA URL, not ``/api/2.0/omnigent``.
+    """A Databricks server shows the ``/omnigent`` SPA URL and NO version.
 
-    What this proves: the header maps the internal API proxy mount the REPL
-    connects on to the recognizable workspace URL a user expects. A
-    regression that rendered the raw ``server_url`` would leak
-    ``/api/2.0/omnigent`` into the banner. The version still appears inline.
+    What this proves two things for a workspace mount: (1) the header maps
+    the internal ``/api/2.0/omnigent`` proxy mount to the recognizable
+    workspace ``/omnigent`` URL — a regression rendering the raw
+    ``server_url`` would leak the API path; and (2) the server-version row
+    is suppressed even when a version is passed, because a workspace build
+    has no meaningful version string to show (its ``/api/version`` returns a
+    placeholder like ``"source"``).
     """
     import re
 
@@ -1560,6 +1563,8 @@ def test_startup_header_shows_databricks_workspace_url_not_api_mount() -> None:
     plain = re.sub(
         r"\x1b\[[0-9;]*m",
         "",
+        # Pass a version to prove the renderer suppresses it for a workspace
+        # mount regardless of what the caller hands in.
         _render_startup_banner_ansi(
             "polly", server_url=api_mount, server_version="0.3.0.dev0", header=header
         ),
@@ -1567,8 +1572,9 @@ def test_startup_header_shows_databricks_workspace_url_not_api_mount() -> None:
     # The clean workspace URL is shown, the internal API path is NOT.
     assert "https://e2-dogfood.staging.cloud.databricks.com/omnigent" in plain
     assert "/api/2.0/omnigent" not in plain
-    url_line = next(line for line in plain.split("\n") if "/omnigent" in line)
-    assert "server 0.3.0.dev0" in url_line
+    # No version row for a Databricks workspace server.
+    assert "server " not in plain
+    assert "0.3.0.dev0" not in plain
 
 
 def test_startup_header_omits_server_version_when_unresolved() -> None:

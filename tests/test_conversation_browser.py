@@ -46,6 +46,29 @@ def test_display_server_url_maps_databricks_api_mount(base_url: str, expected: s
     assert browser.display_server_url(base_url) == expected
 
 
+@pytest.mark.parametrize(
+    "base_url,expected",
+    [
+        ("https://ws.databricks.com/api/2.0/omnigent", True),
+        ("https://ws.databricks.com/api/2.0/omnigent/", True),
+        ("https://ws.databricks.com/omnigent", False),  # the SPA URL, not the API mount
+        ("http://127.0.0.1:6767", False),
+        ("https://omnigent-02m5.onrender.com", False),
+    ],
+)
+def test_is_workspace_hosted_url(base_url: str, expected: bool) -> None:
+    """
+    ``is_workspace_hosted_url`` is true only for the workspace API mount.
+
+    What this proves: the predicate the banner uses to suppress the
+    server-version row fires for ``/api/2.0/omnigent`` and nothing else, so
+    non-Databricks targets keep showing their version.
+
+    :returns: None.
+    """
+    assert browser.is_workspace_hosted_url(base_url) is expected
+
+
 def test_conversation_url_quotes_session_id() -> None:
     """
     Conversation URLs percent-encode ids before appending them to the base URL.

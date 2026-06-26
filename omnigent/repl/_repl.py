@@ -476,7 +476,7 @@ def _render_startup_banner_ansi(
         ``None`` for the minimal banner.
     :returns: ANSI-styled string ready to be written to stdout.
     """
-    from omnigent.conversation_browser import display_server_url
+    from omnigent.conversation_browser import display_server_url, is_workspace_hosted_url
     from omnigent.inner.banner import BannerLine, startup_banner_strings
 
     remote = _is_remote_server_url(server_url)
@@ -486,6 +486,15 @@ def _render_startup_banner_ansi(
     # URLs pass through unchanged. The probe still uses the real base URL via
     # the client; only the displayed string is mapped.
     display_url = display_server_url(server_url) if server_url else server_url
+    # Suppress the version on Databricks workspace mounts — a workspace build
+    # has no meaningful version string to show (authoritative gate; the call
+    # site also skips the probe there, but this guarantees it never renders
+    # regardless of caller).
+    version = (
+        None
+        if (server_url is not None and is_workspace_hosted_url(server_url))
+        else server_version
+    )
 
     if header is None:
         banner = startup_banner_strings(
@@ -518,10 +527,10 @@ def _render_startup_banner_ansi(
     # URL at all the version stands on its own row.
     if display_url is not None:
         url_row = display_url
-        if server_version:
-            url_row = f"{display_url}  ·  server {server_version}"
+        if version:
+            url_row = f"{display_url}  ·  server {version}"
         info_lines.append(BannerLine(url_row, dim=True))
-    elif server_version:
+    elif version:
         info_lines.append(BannerLine(f"server {server_version}", dim=True))
 
     banner = startup_banner_strings(ui_name, info_lines=info_lines, art_color="#F43BA6")
@@ -4308,11 +4317,17 @@ async def run_repl(
         # Installed server version for the header's "server <ver>" row.
         # Probed via the connected (authenticated) client so a short, bounded
         # GET /v1/info never stalls boot and answers even on auth-gated hosted
-        # servers; None on any failure simply omits the row. Only the header
-        # path renders the version, so skip the probe entirely on the
-        # minimal-banner fallback (no header) — no point paying even bounded
-        # latency for a value that won't be shown.
-        server_version = await _fetch_server_version(client) if _header is not None else None
+        # servers; None on any failure simply omits the row. Skipped when:
+        #   - there's no header (minimal banner ignores the version), or
+        #   - the server is a Databricks workspace mount — a workspace build
+        #     reports no meaningful version string (its /api/version returns a
+        #     placeholder like "source"), so showing it is noise.
+        from omnigent.conversation_browser import is_workspace_hosted_url
+
+        _show_version = _header is not None and not (
+            server_url is not None and is_workspace_hosted_url(server_url)
+        )
+        server_version = await _fetch_server_version(client) if _show_version else None
         _sys.stdout.write(
             _render_startup_banner_ansi(
                 ui_name,
