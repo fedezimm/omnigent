@@ -178,13 +178,21 @@ Server, Policy Server, Server database.** Choke points below are from the codeba
 - **SSE chat stream** (`GET /v1/sessions/{id}/stream`): the HTTP handshake is traced by
   FastAPI. Each streamed event is annotated with the active `trace_id` in
   `_format_sse` (`sessions.py:1754`) so the client can correlate UI blocks to the trace.
-- **Browser-origin propagation (in scope):** the Web UI initializes the OpenTelemetry
-  **web SDK** and registers the `@opentelemetry/instrumentation-fetch` (and
-  `xml-http-request`) instrumentation so every `fetch`/SSE call carries a browser-rooted
-  `traceparent`. A trace therefore begins at the user's click in the browser, not at the
-  server. `propagateTraceHeaderCorsUrls` is set to the API origin so the header is
-  attached cross-origin, and the browser exports spans over OTLP/HTTP to the collector
-  (`:4318`). Service name `omni-web`.
+- **Browser-origin propagation (implemented):** `ap-web/src/lib/telemetry.ts`
+  (`initBrowserTelemetry`, called first in `main.tsx`) initializes the OpenTelemetry
+  **web SDK** and registers `@opentelemetry/instrumentation-fetch` and
+  `-xml-http-request` so every `fetch`/SSE call carries a browser-rooted `traceparent`.
+  A trace therefore begins at the user's click in the browser, not at the server. It is
+  **opt-in by configuration** — active only when `VITE_OTEL_EXPORTER_OTLP_ENDPOINT` is
+  set (mirroring the server's "on when a backend is configured" rule); otherwise it is a
+  no-op with zero overhead. The browser exports over OTLP/HTTP to `${endpoint}/v1/traces`.
+  Service name `omni-web` (override via `VITE_OTEL_SERVICE_NAME`). **CORS:** Omnigent is a
+  same-origin deployment — the server serves the SPA and the API from one origin (vite
+  proxies in dev), and there is **no `CORSMiddleware`** — so `traceparent` propagates to
+  same-origin API calls with no server change. `propagateTraceHeaderCorsUrls` is scoped to
+  the app's own origin so the header attaches explicitly and is never leaked to unrelated
+  third-party requests; a future cross-origin/embedded deployment that adds CORS must add
+  `traceparent`/`tracestate` to its allowed request headers.
 - **Session-updates WebSocket** (`/v1/sessions/updates`): **manual**. Inject in
   `_send(frame)` (`sessions.py:14076`); extract in the `_reader()` loop
   (`sessions.py:14117`). Add a `traceparent` field to the envelope
@@ -360,10 +368,12 @@ replay/diff tooling for transcript reconstruction, fork, and resume.
   access controls.
 - **Sampling cost.** `always_on` is for dev/test only; production uses parent-based
   ratio sampling so the cross-boundary parent decision is honored consistently.
-- **Browser-side propagation (in scope).** Uses the OTel web SDK with fetch/XHR
-  instrumentation and `propagateTraceHeaderCorsUrls` set to the API origin. The browser
-  exports over OTLP/HTTP (`:4318`). CORS must allow the `traceparent`/`tracestate`
-  request headers on the server (and any reverse proxy) or the header is silently
-  stripped.
+- **Browser-side propagation (implemented).** OTel web SDK with fetch/XHR
+  instrumentation, opt-in via `VITE_OTEL_EXPORTER_OTLP_ENDPOINT`, exporting over OTLP/HTTP
+  (`:4318`). Omnigent is same-origin with no `CORSMiddleware`, so same-origin `traceparent`
+  propagation needs no server change; `propagateTraceHeaderCorsUrls` is scoped to the
+  app's own origin. A future cross-origin deployment that introduces CORS must allow the
+  `traceparent`/`tracestate` request headers (server and any reverse proxy) or the header
+  is silently stripped.
 </content>
 </invoke>
