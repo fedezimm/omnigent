@@ -155,15 +155,6 @@ def _tmux_session_persistence_commands() -> list[list[str]]:
     return [
         ["set-option", "-gq", "remain-on-exit", "on"],
         ["set-option", "-sq", "exit-empty", "off"],
-        # When the pane's process exits and remain-on-exit keeps it alive,
-        # fire ``pane-died`` and detach every attached client. This causes
-        # ``tmux attach`` subprocesses (both the CLI's direct attach and the
-        # server-side bridge's PTY attach) to exit naturally, unblocking the
-        # waiting ``process.wait()`` so the caller can detect the dead pane
-        # and tear down cleanly. Without this, clients stay attached to the
-        # dead pane indefinitely and Ctrl-C is silently dropped.
-        # -q suppresses errors on older tmux that does not know pane-died.
-        ["set-hook", "-gq", "pane-died", "detach-client -a"],
     ]
 
 
@@ -984,6 +975,15 @@ class TerminalInstance:
                     f"wait-for -S {_TMUX_START_ON_ATTACH_CHANNEL}",
                 ]
             )
+        # ``pane-died`` is a window-scope hook that fires when remain-on-exit
+        # keeps the pane alive after the inner process exits. We need to set
+        # it AFTER new-session (not before) because window scope requires an
+        # existing window, and global scope (-g) does not fire for pane-died.
+        pane_died_hook: list[list[str]] = (
+            [["set-hook", "-w", "pane-died", "detach-client -a"]]
+            if self.keep_alive_after_exit
+            else []
+        )
         cmd = [
             *self._tmux_base_cmd(),
             *_tmux_command_sequence(
@@ -1006,6 +1006,7 @@ class TerminalInstance:
                         effective_cwd,
                         inner_str,
                     ],
+                    *pane_died_hook,
                 ]
             ),
         ]
@@ -1288,7 +1289,11 @@ class TerminalInstance:
             if await self._pane_is_dead_async():
                 # remain-on-exit kept the server alive after the inner CLI
                 # exited; report the exit rather than treating the frozen pane
-                # as an idle agent.
+                # as an idle agent. Detach all clients so attached tmux attach
+                # subprocesses (CLI direct attach, server-side bridge PTY) exit
+                # naturally instead of hanging on the dead pane.
+                with contextlib.suppress(Exception):
+                    await self._tmux_output("detach-client", "-s", self.tmux_target)
                 self.running = False
                 if on_exit is not None:
                     await _fire(on_exit, "exit")
@@ -1440,7 +1445,10 @@ class TerminalInstance:
                 # capture-pane still succeeds (the snapshot above is the final
                 # frame, now remembered for diagnostics). Report the exit
                 # deterministically instead of mistaking the frozen pane for an
-                # idle agent and leaving the session hung.
+                # idle agent and leaving the session hung. Detach all clients
+                # so attached tmux attach subprocesses exit naturally.
+                with contextlib.suppress(Exception):
+                    self._tmux_output_sync("detach-client", "-s", self.tmux_target)
                 self.running = False
                 if on_exit is not None:
                     self._fire_watch_callback(on_exit, "exit")
