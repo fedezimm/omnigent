@@ -351,13 +351,35 @@ def _build_sys_session_send_schema(
                                     },
                                     **harness_property,
                                     "cost_budget": {
-                                        "type": "number",
+                                        "type": "object",
+                                        "properties": {
+                                            "max_cost_usd": {
+                                                "type": "number",
+                                                "description": (
+                                                    "Optional hard limit in USD. "
+                                                    "Blocks tool calls once exceeded "
+                                                    "on expensive models."
+                                                ),
+                                            },
+                                            "ask_thresholds_usd": {
+                                                "type": "array",
+                                                "items": {"type": "number"},
+                                                "description": (
+                                                    "Optional soft warning checkpoints "
+                                                    "in USD. The subagent asks for "
+                                                    "approval the first time spend "
+                                                    "crosses each threshold (each must "
+                                                    "be < max_cost_usd if both are set)."
+                                                ),
+                                            },
+                                        },
+                                        "additionalProperties": False,
                                         "description": (
-                                            "Optional per-subagent cost budget in USD. "
-                                            "When set, the spawned sub-agent session will have a "
-                                            "subagent_cost_budget policy enforced at this limit. "
-                                            "Applies only when this send creates the session; "
-                                            "ignored on continuation sends."
+                                            "Optional per-subagent cost budget configuration "
+                                            "with max_cost_usd (hard limit) and/or "
+                                            "ask_thresholds_usd (soft checkpoints). At least "
+                                            "one must be set. Applies only when this send "
+                                            "creates the session; ignored on continuation sends."
                                         ),
                                     },
                                 },

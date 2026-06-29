@@ -979,25 +979,61 @@ def _subagent_harness_override_from_args(args: dict[str, Any]) -> str | None:
     return raw_harness
 
 
-def _subagent_cost_budget_from_args(args: dict[str, Any]) -> float | None:
+def _subagent_cost_budget_from_args(
+    args: dict[str, Any],
+) -> dict[str, Any] | None:
     """
     Extract and validate the per-dispatch cost budget from ``sys_session_send`` args.
 
-    The optional ``cost_budget`` field lives inside the object form of
-    ``args`` (``{"input": ..., "cost_budget": 2.0}``).
+    The optional ``cost_budget`` field is an object with max_cost_usd
+    (hard limit) and/or ask_thresholds_usd (soft checkpoints). At least
+    one must be present.
 
     :param args: Parsed ``sys_session_send`` arguments.
-    :returns: The validated budget in USD, or ``None`` when absent.
-    :raises ValueError: If ``cost_budget`` is present but not positive.
+    :returns: A dict with max_cost_usd and/or ask_thresholds_usd, or
+        ``None`` when absent.
+    :raises ValueError: If cost_budget is malformed or values are invalid.
     """
     raw_args = args.get("args")
     if isinstance(raw_args, dict):
         budget = raw_args.get("cost_budget")
-        if budget is not None:
-            budget = float(budget)
-            if budget <= 0:
-                raise ValueError("cost_budget must be > 0")
-            return budget
+        if budget is None:
+            return None
+
+        if not isinstance(budget, dict):
+            raise ValueError("cost_budget must be an object")
+
+        result: dict[str, Any] = {}
+
+        # Extract and validate max_cost_usd if present.
+        if "max_cost_usd" in budget:
+            max_cost = budget["max_cost_usd"]
+            if max_cost is not None:
+                max_cost = float(max_cost)
+                if max_cost <= 0:
+                    raise ValueError("cost_budget.max_cost_usd must be > 0")
+                result["max_cost_usd"] = max_cost
+
+        # Extract and validate ask_thresholds_usd if present.
+        if "ask_thresholds_usd" in budget:
+            thresholds = budget["ask_thresholds_usd"]
+            if thresholds is not None:
+                if not isinstance(thresholds, list):
+                    raise ValueError("cost_budget.ask_thresholds_usd must be an array")
+                thresholds = [float(t) for t in thresholds]
+                if not all(t > 0 for t in thresholds):
+                    raise ValueError("cost_budget.ask_thresholds_usd values must be > 0")
+                # Check that thresholds are less than max if both are set.
+                if "max_cost_usd" in result and result["max_cost_usd"] is not None:
+                    if any(t >= result["max_cost_usd"] for t in thresholds):
+                        raise ValueError("ask_thresholds_usd values must be < max_cost_usd")
+                result["ask_thresholds_usd"] = thresholds
+
+        # At least one must be present.
+        if not result:
+            raise ValueError("cost_budget must include max_cost_usd and/or ask_thresholds_usd")
+        return result
+
     return None
 
 
@@ -1406,7 +1442,7 @@ async def _execute_subagent_tool(
                 "name": "__subagent_cost_budget",
                 "type": "python",
                 "handler": "omnigent.policies.builtins.cost.subagent_cost_budget",
-                "factory_params": {"max_cost_usd": cost_budget},
+                "factory_params": cost_budget,  # Dict with max_cost_usd and/or ask_thresholds_usd
                 "enabled": True,
             }
             try:
