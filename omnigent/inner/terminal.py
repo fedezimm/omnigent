@@ -155,6 +155,15 @@ def _tmux_session_persistence_commands() -> list[list[str]]:
     return [
         ["set-option", "-gq", "remain-on-exit", "on"],
         ["set-option", "-sq", "exit-empty", "off"],
+        # When the pane's process exits and remain-on-exit keeps it alive,
+        # fire ``pane-died`` and detach every attached client. This causes
+        # ``tmux attach`` subprocesses (both the CLI's direct attach and the
+        # server-side bridge's PTY attach) to exit naturally, unblocking the
+        # waiting ``process.wait()`` so the caller can detect the dead pane
+        # and tear down cleanly. Without this, clients stay attached to the
+        # dead pane indefinitely and Ctrl-C is silently dropped.
+        # -q suppresses errors on older tmux that does not know pane-died.
+        ["set-hook", "-gq", "pane-died", "detach-client -a"],
     ]
 
 
