@@ -149,7 +149,33 @@ class TracingContext:
                 attrs["parent_span_id"] = format(ctx.span_id, "016x")
             parent = None
 
-        ctx_carrier = trace.set_span_in_context(parent) if parent is not None else None
+        if parent is None:
+            # No explicit parent span. Check if the current OTel context
+            # contains the sentinel parent injected by trace_context_for_response.
+            # If so, build a context that carries the trace ID but has no
+            # parent span — this makes the agent span a true root span in
+            # the OTLP export (parent_span_id absent), so MLflow finalizes
+            # the trace status to OK instead of leaving it IN_PROGRESS.
+            from opentelemetry.trace import NonRecordingSpan, SpanContext, TraceFlags
+
+            from omnigent.runtime.telemetry import SENTINEL_PARENT_SPAN_ID
+
+            current_ctx = trace.get_current_span().get_span_context()
+            if current_ctx is not None and current_ctx.span_id == SENTINEL_PARENT_SPAN_ID:
+                # Inject a NonRecordingSpan with span_id=0 as the fake root.
+                # The Python OTLP exporter skips parent_span_id when span_id
+                # is 0, so the exported proto has no parentSpanId field.
+                root_ctx = SpanContext(
+                    trace_id=current_ctx.trace_id,
+                    span_id=0,
+                    is_remote=True,
+                    trace_flags=TraceFlags(TraceFlags.SAMPLED),
+                )
+                ctx_carrier = trace.set_span_in_context(NonRecordingSpan(root_ctx))
+            else:
+                ctx_carrier = None
+        else:
+            ctx_carrier = trace.set_span_in_context(parent)
         span = _tracer().start_span(
             name=f"agent:{agent_name}",
             context=ctx_carrier,

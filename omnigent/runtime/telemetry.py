@@ -45,6 +45,10 @@ _logger = logging.getLogger(__name__)
 
 _RESP_PREFIX = "resp_"
 _HEX_LEN = 32
+# Sentinel span ID used in trace_context_for_response. start_agent_span
+# detects this value and strips the parent so the agent span is exported
+# as a true root span (parent_span_id absent in OTLP proto).
+SENTINEL_PARENT_SPAN_ID = 0x1000000000000001
 
 _capture_content: bool = False
 _initialized: bool = False
@@ -194,7 +198,7 @@ def trace_context_for_response(
     # it never matches any real span so the agent span is effectively the
     # root for display purposes, even though it has a non-null parent_id in
     # the OTLP payload.
-    traceparent = f"00-{trace_id_hex}-1000000000000001-01"
+    traceparent = f"00-{trace_id_hex}-{SENTINEL_PARENT_SPAN_ID:016x}-01"
     ctx = TraceContextTextMapPropagator().extract({"traceparent": traceparent})
     token = context.attach(ctx)
     try:
