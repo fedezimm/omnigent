@@ -13532,6 +13532,83 @@ async def test_auto_create_kiro_terminal_launches_required_terminal_with_isolate
 
 
 @pytest.mark.asyncio
+async def test_auto_create_kiro_terminal_skips_mcp_wiring_without_relay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without a comment-relay callback, the Omnigent MCP is NOT wired.
+
+    The workspace mcp.json write + relay seed are gated on ``server_client`` AND
+    ``ensure_comment_relay`` together, so serve-mcp never launches with no relay
+    to route calls back to. With ``ensure_comment_relay`` absent the gate must
+    short-circuit: no workspace ``mcp.json`` is written.
+    """
+    import omnigent.kiro_native as kiro_native
+
+    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:6767")
+    monkeypatch.setattr(kiro_native_bridge, "_BRIDGE_ROOT", tmp_path / "kiro-bridge")
+    monkeypatch.setattr(
+        kiro_native,
+        "resolve_kiro_executable",
+        lambda **_kwargs: "/usr/bin/kiro-cli",
+    )
+
+    async def _noop_supervise(**_kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr(
+        "omnigent.kiro_native_session_forwarder.supervise_kiro_session_forwarder",
+        _noop_supervise,
+    )
+    monkeypatch.setattr(
+        "omnigent.kiro_native_permissions.supervise_kiro_permission_mirror",
+        _noop_supervise,
+    )
+    mcp_writes: list[Any] = []
+    monkeypatch.setattr(
+        kiro_native_bridge,
+        "write_kiro_workspace_mcp_config",
+        lambda *args, **kwargs: mcp_writes.append((args, kwargs)),
+    )
+
+    async def _fake_launch_config(**_kwargs: Any) -> _KiroNativeLaunchConfig:
+        return _KiroNativeLaunchConfig(
+            workspace=tmp_path,
+            terminal_launch_args=["hello"],
+            external_session_id=None,
+        )
+
+    monkeypatch.setattr("omnigent.runner.app._kiro_native_launch_config", _fake_launch_config)
+
+    class _FakeResourceRegistry:
+        terminal_registry = None
+
+        async def launch_required_terminal(
+            self, *, session_id: str, **_kwargs: Any
+        ) -> SessionResourceView:
+            return SessionResourceView(
+                id="terminal_kiro_main",
+                type="terminal",
+                session_id=session_id,
+                name="kiro:main",
+                metadata={"terminal_name": "kiro", "session_key": "main", "running": True},
+            )
+
+    # No ``ensure_comment_relay`` argument -> the MCP wiring gate stays closed.
+    await _auto_create_kiro_terminal(
+        "conv_kiro_no_relay",
+        _FakeResourceRegistry(),  # type: ignore[arg-type]
+        lambda _sid, _evt: None,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    assert mcp_writes == []
+    assert not (tmp_path / ".kiro" / "settings" / "mcp.json").exists()
+
+
+@pytest.mark.asyncio
 async def test_auto_create_pi_terminal_inherits_agent_sandbox(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
