@@ -7,8 +7,12 @@ afterEach(cleanup);
 /** Args for a two-task fan-out, as the brain passes to sys_advise_models. */
 const TWO_TASK_ARGS = {
   tasks: [
-    { title: "review-security", agent: "codex", task: "scan the diff" },
-    { title: "refactor-auth", agent: "claude_code", task: "refactor the auth flow" },
+    { title: "review-security", agents: [{ agent: "codex", models: null }], task: "scan the diff" },
+    {
+      title: "refactor-auth",
+      agents: [{ agent: "claude_code", models: null }],
+      task: "refactor the auth flow",
+    },
   ],
 };
 
@@ -35,19 +39,29 @@ const TWO_TASK_OUTPUT = JSON.stringify({
 const card = () => screen.getByTestId("smart-routing-card");
 
 describe("parsePlannedTasks", () => {
-  it("extracts title+agent rows and drops malformed entries", () => {
+  it("expands agents array into one row per agent", () => {
     const tasks = parsePlannedTasks({
       tasks: [
-        { title: "a", agent: "codex", task: "x" },
-        { title: "", agent: "codex" }, // empty title → dropped
+        {
+          title: "refactor",
+          agents: [{ agent: "claude_code" }, { agent: "pi" }],
+          task: "x",
+        },
+        { title: "", agents: [{ agent: "codex" }] }, // empty title → dropped
         "not-an-object", // → dropped
-        { title: "b", agent: "claude_code" },
       ],
     });
     expect(tasks).toEqual([
-      { title: "a", agent: "codex" },
-      { title: "b", agent: "claude_code" },
+      { title: "refactor", agent: "claude_code" },
+      { title: "refactor", agent: "pi" },
     ]);
+  });
+
+  it("accepts legacy single-agent shape for backwards compat", () => {
+    const tasks = parsePlannedTasks({
+      tasks: [{ title: "a", agent: "codex", task: "x" }],
+    });
+    expect(tasks).toEqual([{ title: "a", agent: "codex" }]);
   });
 
   it("returns [] when tasks is missing or not an array", () => {
@@ -60,8 +74,9 @@ describe("parseRecommendations", () => {
   it("maps titles to model/rationale/agent (no tier)", () => {
     const recs = parseRecommendations(TWO_TASK_OUTPUT);
     expect(recs).not.toBeNull();
-    expect(recs!.get("refactor-auth")).toEqual({
+    expect(recs!.get("refactor-auth:claude_code")).toEqual({
       model: "databricks-claude-opus-4-8",
+      title: "refactor-auth",
       rationale: "Multi-file refactor needs deep reasoning.",
       agent: "claude_code",
     });

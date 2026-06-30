@@ -25,6 +25,7 @@ interface PlannedTask {
 interface Recommendation {
   model: string;
   rationale: string;
+  title: string;
   /** Target worker as echoed in the response; `""` when absent. */
   agent: string;
 }
@@ -41,7 +42,20 @@ export function parsePlannedTasks(args: Record<string, unknown>): PlannedTask[] 
   for (const entry of raw) {
     if (typeof entry !== "object" || entry === null) continue;
     const rec = entry as Record<string, unknown>;
-    if (typeof rec.title === "string" && rec.title.length > 0 && typeof rec.agent === "string") {
+    if (typeof rec.title !== "string" || rec.title.length === 0) continue;
+    // New shape: agents: [{agent, models}]
+    if (Array.isArray(rec.agents)) {
+      for (const ae of rec.agents) {
+        if (
+          typeof ae === "object" &&
+          ae !== null &&
+          typeof (ae as Record<string, unknown>).agent === "string"
+        ) {
+          tasks.push({ title: rec.title, agent: (ae as Record<string, unknown>).agent as string });
+        }
+      }
+    } else if (typeof rec.agent === "string") {
+      // Legacy single-agent shape (backwards compat)
       tasks.push({ title: rec.title, agent: rec.agent });
     }
   }
@@ -76,10 +90,14 @@ export function parseRecommendations(output: string): Map<string, Recommendation
       typeof rec.model === "string" &&
       rec.model.length > 0
     ) {
-      map.set(rec.title, {
+      const agent = typeof rec.agent === "string" ? rec.agent : "";
+      const title = rec.title as string;
+      // Key by "title:agent" so multiple agents per task don't collide.
+      map.set(`${title}:${agent}`, {
         model: rec.model,
+        title,
         rationale: typeof rec.rationale === "string" ? rec.rationale : "",
-        agent: typeof rec.agent === "string" ? rec.agent : "",
+        agent,
       });
     }
   }
@@ -119,7 +137,7 @@ export function SmartRoutingCard({ arguments: args, output, state }: SmartRoutin
   // a sized plan still renders rows.
   const tasks = useMemo(() => {
     if (plannedTasks.length > 0 || recommendations === null) return plannedTasks;
-    return [...recommendations.entries()].map(([title, rec]) => ({ title, agent: rec.agent }));
+    return [...recommendations.values()].map((rec) => ({ title: rec.title, agent: rec.agent }));
   }, [plannedTasks, recommendations]);
   const judging = state === "input-available";
   // Any terminal state without parseable recommendations is a failure:
@@ -173,9 +191,9 @@ export function SmartRoutingCard({ arguments: args, output, state }: SmartRoutin
         </p>
       ) : (
         tasks.map((task, i) => {
-          const rec = recommendations?.get(task.title) ?? null;
+          const rec = recommendations?.get(`${task.title}:${task.agent}`) ?? null;
           return (
-            <div key={task.title} className="flex flex-col gap-0.5">
+            <div key={`${task.title}:${task.agent}`} className="flex flex-col gap-0.5">
               <div className="flex items-center gap-2 text-xs">
                 <span className="min-w-0 truncate font-mono text-foreground">{task.title}</span>
                 {task.agent.length > 0 && (

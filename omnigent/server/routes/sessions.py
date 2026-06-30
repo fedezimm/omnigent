@@ -12825,46 +12825,62 @@ async def _handle_advise_models_mcp(
         if not isinstance(task, dict):
             continue
         title = task.get("title", "")
-        agent = task.get("agent", "")
         task_text = task.get("task", "")
-        harness = _resolve_harness_for_worker(agent)
-        tiers = infer_tiers(harness) if harness else None
-        if tiers is None:
-            recommendations.append(
-                {
-                    "title": title,
-                    "agent": agent,
-                    "model": None,
-                    "rationale": f"no tiers available for harness {harness!r}",
-                }
-            )
+        agents_spec = task.get("agents")
+        if not isinstance(agents_spec, list) or not agents_spec:
             continue
-        try:
-            verdict = await routing_client.route(task_text, tiers)
-        except Exception:  # routing failures must not crash the advisor
-            _logger.exception(
-                "_handle_advise_models_mcp: routing_client.route failed for task %r agent %r",
-                title,
-                agent,
-            )
-            verdict = None
-        if verdict is None:
-            recommendations.append(
-                {
-                    "title": title,
-                    "agent": agent,
-                    "model": None,
-                    "rationale": "router returned no verdict",
-                }
-            )
-        else:
-            recommendations.append(
-                {
-                    "title": title,
-                    "agent": agent,
-                    "model": verdict.model,
-                    "rationale": verdict.rationale,
-                }
+        for agent_entry in agents_spec:
+            if not isinstance(agent_entry, dict):
+                continue
+            agent = agent_entry.get("agent", "")
+            # models=null/omitted → use server tier defaults;
+            # models=[...] → constrain picks to that list.
+            explicit_models: list[str] | None = agent_entry.get("models")
+            if explicit_models is not None and not isinstance(explicit_models, list):
+                explicit_models = None
+            harness = _resolve_harness_for_worker(agent)
+            if explicit_models is not None and len(explicit_models) > 0:
+                # Build a single-tier map from the caller-supplied list
+                # so the rubric presents only the allowed models.
+                tiers: dict[str, list[str]] | None = {"cheap": explicit_models}
+            else:
+                tiers = infer_tiers(harness) if harness else None
+            if tiers is None:
+                recommendations.append(
+                    {
+                        "title": title,
+                        "agent": agent,
+                        "model": None,
+                        "rationale": f"no tiers available for harness {harness!r}",
+                    }
+                )
+                continue
+            try:
+                verdict = await routing_client.route(task_text, tiers)
+            except Exception:  # routing failures must not crash the advisor
+                _logger.exception(
+                    "_handle_advise_models_mcp: route failed task=%r agent=%r",
+                    title,
+                    agent,
+                )
+                verdict = None
+            if verdict is None:
+                recommendations.append(
+                    {
+                        "title": title,
+                        "agent": agent,
+                        "model": None,
+                        "rationale": "router returned no verdict",
+                    }
+                )
+            else:
+                recommendations.append(
+                    {
+                        "title": title,
+                        "agent": agent,
+                        "model": verdict.model,
+                        "rationale": verdict.rationale,
+                    }
             )
 
     return _mcp_tool_result(
