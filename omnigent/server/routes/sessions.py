@@ -12781,7 +12781,7 @@ async def _handle_advise_models_mcp(
         return _mcp_tool_result(rpc_id, json.dumps({"router_on": False, "recommendations": []}))
 
     from omnigent.model_catalog import spec_harness
-    from omnigent.server.smart_routing import infer_tiers
+    from omnigent.server.smart_routing import infer_models
 
     # Resolve the parent agent spec to look up sub-agent harnesses.
     spec: Any | None = None
@@ -12830,10 +12830,10 @@ async def _handle_advise_models_mcp(
         if not isinstance(agents_spec, list) or not agents_spec:
             continue
 
-        # Merge per-agent tier maps so the judge sees difficulty tiers
-        # with models from all agents, and maps chosen model → agent.
+        # Build a combined model list from all agent entries,
+        # preserving cheapest→powerful order. Map chosen model → agent.
         model_to_agent: dict[str, str] = {}
-        combined_tiers: dict[str, list[str]] = {}
+        combined_models: list[str] = []
         for agent_entry in agents_spec:
             if not isinstance(agent_entry, dict):
                 continue
@@ -12842,28 +12842,22 @@ async def _handle_advise_models_mcp(
             if explicit_models is not None and not isinstance(explicit_models, list):
                 explicit_models = None
             if explicit_models:
-                # Caller-supplied list: treat as a single tier.
-                for m in explicit_models:
-                    if m not in model_to_agent:
-                        model_to_agent[m] = agent
-                        combined_tiers.setdefault("cheap", []).append(m)
+                candidates = explicit_models
             else:
                 harness = _resolve_harness_for_worker(agent)
-                agent_tiers = infer_tiers(harness) if harness else None
-                if agent_tiers:
-                    for tier_name, models in agent_tiers.items():
-                        for m in models:
-                            if m not in model_to_agent:
-                                model_to_agent[m] = agent
-                                combined_tiers.setdefault(tier_name, []).append(m)
+                candidates = infer_models(harness) or []
+            for m in candidates:
+                if m not in model_to_agent:
+                    model_to_agent[m] = agent
+                    combined_models.append(m)
 
-        if not combined_tiers:
+        if not combined_models:
             recommendations.append(
                 {"title": title, "agent": None, "model": None, "rationale": "no candidates"}
             )
             continue
         try:
-            verdict = await routing_client.route(task_text, combined_tiers)
+            verdict = await routing_client.route(task_text, combined_models)
         except Exception:  # routing failures must not crash the advisor
             _logger.exception("_handle_advise_models_mcp: route failed task=%r", title)
             verdict = None
