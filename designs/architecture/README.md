@@ -24,11 +24,16 @@ Each is also embedded as a `§7` subsection of the master doc; these are the sta
 - [`creds-auth-onboarding.md`](creds-auth-onboarding.md) — credentials, auth, onboarding
 - [`observability.md`](observability.md) — distributed tracing
 
-## 3. Google-doc answers
+## 3. Diagrams ([`diagrams/`](diagrams))
+Renderable Mermaid sources + rendered PNGs, cross-checked against the code.
+- [`diagrams/topology.mmd`](diagrams/topology.mmd) ([png](diagrams/topology.png)) — process topology & channels.
+- [`diagrams/executor-events.mmd`](diagrams/executor-events.mmd) ([png](diagrams/executor-events.png)) — the two harness couplings (SDK in-process loop vs native vendor-CLI + runner-resident forwarder), over the runner↔harness UDS.
+
+## 4. Google-doc answers
 - [`../STABILITY-CUJ-ANSWERS.md`](../STABILITY-CUJ-ANSWERS.md) — paste-ready answers to the
   "Stability & Reliability" tab ("How does claude-code / codex / polly behave when…").
 
-## 4. CUJs
+## 5. CUJs
 - [`../CUJ-MAP.md`](../CUJ-MAP.md) — the CUJ inventory (the list of journeys).
 - [`../CUJ-ANALYSIS.md`](../CUJ-ANALYSIS.md) — per-CUJ mechanisms + `§7` (round-1) & `§8` (round-2)
   verification addenda.
