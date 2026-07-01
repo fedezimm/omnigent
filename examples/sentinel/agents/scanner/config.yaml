@@ -14,16 +14,15 @@ executor:
     harness: claude-sdk
 
 # Filesystem access so the scanner can read files, grep, and inspect git
-# history. `sandbox: type: none` runs unsandboxed in the caller's repo (zero
-# setup, cross-platform). `read_only_os` below denies the file-write/edit tools
-# as a BEST-EFFORT guardrail -- it does not gate shell, so it is not a hard
-# boundary. For untrusted code, sandbox it (`sandbox.type: linux_bwrap` /
-# `darwin_seatbelt`) so cwd is read-only. See the orchestrator config.
+# history. Sandboxed by default: omitting `sandbox.type` auto-selects the
+# platform backend (`linux_bwrap` / `darwin_seatbelt`), binding cwd read-only
+# so shell writes are contained. Linux needs `bwrap` installed (fails loud with
+# a hint if missing); macOS uses the built-in sandbox-exec. See the orchestrator
+# config. `read_only_os` below is defense-in-depth (refuses the file-write tools
+# early); add `sandbox: {type: none}` only for code you fully trust.
 os_env:
   type: caller_process
   cwd: .
-  sandbox:
-    type: none
 
 # Same guardrails the rest of the bundle uses: blast_radius bounds shell, and
 # read_only_os denies the file-write/edit tools (best-effort; shell not gated).
