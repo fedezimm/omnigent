@@ -413,3 +413,192 @@ def test_policy_denies_tool_call_by_name(
         f"bypassing dispatch incorrectly.\n"
         f"stdout tail:\n{result.stdout[-2500:]}"
     )
+
+
+# Unique reason string for the sub-agent ban policy.
+_SUB_AGENT_BAN_REASON_SENTINEL = "SUB_AGENT_BAN_TEST_SENTINEL_XYZQ"
+
+
+@pytest.fixture()
+def sub_agent_ban_yaml_factory(tmp_path: Path) -> Callable[[str, str], Path]:
+    """
+    Factory that writes an omnigent-shaped YAML declaring one inline
+    AgentTool sub-agent (``worker``) and a ``type: function`` policy
+    that denies ``tool_call:worker``.
+
+    This exercises the path that was previously broken: inline
+    AgentTools are registered as ``sys_session_send`` dispatches, not
+    as tools literally named ``worker``, so a naïve policy gate never
+    saw ``tool_name == "worker"`` and the sub-agent spawned anyway.
+    The fix narrows the effective tool name in the TOOL_CALL evaluation
+    context to the sub-agent's declared name before the policy engine
+    runs.
+
+    :param tmp_path: Pytest's per-test temp dir. The YAML is single-use.
+    :returns: ``(harness, model) -> Path`` factory.
+    """
+
+    def _build(harness: str, model: str) -> Path:
+        config = {
+            "name": f"sub_agent_ban_probe_{harness}",
+            "prompt": (
+                "You have a worker sub-agent. Dispatch it once to handle the user's task. "
+                "If the tool output contains 'Denied by policy', reply with one short "
+                "sentence saying the sub-agent dispatch was denied. Do not retry."
+            ),
+            "executor": {
+                "model": model,
+                "harness": harness,
+            },
+            "tools": {
+                "worker": {
+                    "type": "agent",
+                    "description": "A worker sub-agent that handles tasks.",
+                    "prompt": "You are a worker sub-agent.",
+                    "executor": {
+                        "model": model,
+                        "harness": harness,
+                    },
+                },
+            },
+            "policies": {
+                "deny_worker_sub_agent": {
+                    "type": "function",
+                    "on": ["tool_call:worker"],
+                    "function": {
+                        "path": "omnigent.policies.function.make_fixed_action_callable",
+                        "arguments": {
+                            "action": "deny",
+                            "reason": _SUB_AGENT_BAN_REASON_SENTINEL,
+                            "on_phases": ["tool_call"],
+                            "on_tools": ["worker"],
+                        },
+                    },
+                },
+            },
+        }
+        path = tmp_path / f"sub_agent_ban_{harness}.yaml"
+        path.write_text(yaml.safe_dump(config))
+        return path
+
+    return _build
+
+
+@pytest.mark.parametrize("harness,model", _HARNESS_HARNESS_MODELS, ids=_HARNESS_IDS)
+def test_policy_denies_sub_agent_by_name(
+    omnigent_python: Path,
+    omnigent_repo_root: Path,
+    mock_credentials_env: dict[str, str],
+    mock_llm_server_url: str,
+    sub_agent_ban_yaml_factory: Callable[[str, str], Path],
+    harness: str,
+    model: str,
+) -> None:
+    """
+    ``omnigent run <yaml> -p "<task prompt>"`` intercepts the LLM's
+    ``sys_session_send(agent="worker", ...)`` call via a
+    ``tool_call:worker`` policy and returns a DENY sentinel as the
+    tool result — proving end-to-end that:
+
+    1. The translator expanded ``on: [tool_call:worker]`` into a
+       PhaseSelector that narrows by the sub-agent's declared name.
+    2. The TOOL_CALL policy gate in ``_handle_mcp_tools_call`` resolved
+       the effective tool name from ``sys_session_send`` arguments to
+       ``"worker"`` before calling ``engine.evaluate``.
+    3. On DENY, the gate returned an MCP error that the runner
+       surfaced to the LLM as a denied tool result instead of spawning
+       the sub-agent.
+    4. The LLM saw the denial and produced a final reply acknowledging
+       it rather than retrying.
+
+    What breaks if this fails:
+
+    - The effective-tool-name resolution in ``_handle_mcp_tools_call``
+      regressed — the policy engine still sees ``sys_session_send``
+      and the sub-agent spawns despite the ban.
+    - The ``on_tools: [worker]`` → PhaseSelector expansion for
+      AgentTool sub-agents regressed.
+    - The ``make_fixed_action_callable`` factory stopped producing a
+      DENY result for the nominated tool.
+
+    The mock LLM is configured to emit a ``sys_session_send`` tool
+    call on the first turn, then acknowledge the denial on the second
+    turn — this deterministically exercises the sub-agent TOOL_CALL
+    enforcement path without spawning a real child session.
+
+    :param omnigent_python: Shared interpreter fixture.
+    :param omnigent_repo_root: Subprocess cwd.
+    :param mock_credentials_env: Mock-LLM env vars.
+    :param mock_llm_server_url: Mock server URL for configuring
+        response queues.
+    :param sub_agent_ban_yaml_factory: Builder for the sub-agent-ban YAML.
+    :param harness: The harness identifier.
+    :param model: The model identifier.
+    """
+    # Turn 1: LLM emits a sys_session_send call for the "worker"
+    # sub-agent → policy intercepts and returns DENY as tool output.
+    # Turn 2: LLM sees the denial and acknowledges it.
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {
+                "tool_calls": [
+                    {
+                        "call_id": "call_subagent_1",
+                        "name": "sys_session_send",
+                        "arguments": (
+                            '{"agent": "worker", "title": "task1", "args": "handle the task"}'
+                        ),
+                    }
+                ]
+            },
+            {"text": "The sub-agent dispatch was denied by policy."},
+        ],
+    )
+    yaml_path = sub_agent_ban_yaml_factory(harness, model)
+    prompt = "Please dispatch the worker sub-agent to handle a task."
+    result = subprocess.run(
+        [
+            str(omnigent_python),
+            "-m",
+            "omnigent",
+            "run",
+            str(yaml_path),
+            "--no-session",
+            "-p",
+            prompt,
+        ],
+        env=mock_credentials_env,
+        cwd=str(omnigent_repo_root),
+        capture_output=True,
+        text=True,
+        timeout=_TIMEOUT_SEC,
+    )
+
+    assert result.returncode == 0, (
+        f"omnigent exited {result.returncode} before reaching enforcement. "
+        f"stderr tail:\n{result.stderr[-2000:]}"
+    )
+
+    # The final reply must acknowledge the denial. If the sub-agent ban
+    # didn't fire, the runner would attempt to spawn the child session
+    # and the LLM would see a launch handle rather than a denial.
+    assert "denied" in result.stdout.lower(), (
+        f"Final assistant reply did not acknowledge the denial. "
+        f"Sub-agent TOOL_CALL enforcement likely did not fire — the "
+        f"worker sub-agent was dispatched instead of being blocked.\n"
+        f"stdout tail:\n{result.stdout[-2500:]}\n"
+        f"stderr tail:\n{result.stderr[-1500:]}"
+    )
+
+    # The ban sentinel must appear somewhere in the output (tool result
+    # fed back to the LLM or the final reply). Its presence proves OUR
+    # policy fired and not a different deny path.
+    assert (
+        _SUB_AGENT_BAN_REASON_SENTINEL in result.stdout or "Denied by policy" in result.stdout
+    ), (
+        f"Neither the ban sentinel {_SUB_AGENT_BAN_REASON_SENTINEL!r} nor "
+        f"'Denied by policy' appeared in stdout — a different code path "
+        f"denied the call or the policy reason is being dropped.\n"
+        f"stdout tail:\n{result.stdout[-2500:]}"
+    )

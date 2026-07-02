@@ -10532,6 +10532,25 @@ def _build_actor(user_id: str | None) -> dict[str, str] | None:
     return {"run_as": user_id}
 
 
+def _subagent_effective_tool_name(tool_name: str, args: dict[str, Any]) -> str:
+    """
+    Resolve the effective tool name for policy matching.
+
+    When the LLM dispatches a named sub-agent via ``sys_session_send``,
+    the ``agent`` argument holds the sub-agent's declared name (e.g.
+    ``"worker"``). Policies written as ``match_tools:[worker]`` /
+    ``tool_call:worker`` target that declared name, not the generic
+    ``sys_session_send`` builtin. Substitute here so the PhaseSelector
+    comparison sees the name the YAML author intended.
+
+    Non-sub-agent calls (session_id mode, unknown tool) pass through
+    unchanged.
+    """
+    if tool_name == "sys_session_send" and isinstance(args.get("agent"), str) and args["agent"]:
+        return args["agent"]
+    return tool_name
+
+
 def _build_evaluation_context(
     phase: Phase,
     data: dict[str, Any] | str,
@@ -10578,10 +10597,13 @@ def _build_evaluation_context(
     if phase == Phase.TOOL_CALL:
         tool_name = data.get("name") or ""
         args = data.get("arguments") or {}
+        effective_name = _subagent_effective_tool_name(
+            tool_name, args if isinstance(args, dict) else {}
+        )
         return EvaluationContext(
             phase=phase,
             content={"name": tool_name, "arguments": args},
-            tool_name=tool_name or None,
+            tool_name=effective_name or None,
             actor=actor,
             model=hook_model,
             harness=hook_harness,
@@ -10687,10 +10709,13 @@ async def _evaluate_tool_call_policy(
     except (ValueError, TypeError):
         args_payload = arguments_str
 
+    effective_tool_name = _subagent_effective_tool_name(
+        tool_name, args_payload if isinstance(args_payload, dict) else {}
+    )
     ctx = EvaluationContext(
         phase=Phase.TOOL_CALL,
         content={"name": tool_name, "arguments": args_payload},
-        tool_name=tool_name,
+        tool_name=effective_tool_name,
         actor=actor,
     )
     result = await engine.evaluate(ctx)
@@ -13360,7 +13385,7 @@ async def _handle_mcp_tools_call(
         retry_ctx = EvaluationContext(
             phase=Phase.TOOL_CALL,
             content={"name": namespaced_name, "arguments": arguments},
-            tool_name=namespaced_name,
+            tool_name=_subagent_effective_tool_name(namespaced_name, arguments),
             actor=actor,
         )
         retry_result = await engine.evaluate(retry_ctx)
@@ -13428,7 +13453,7 @@ async def _handle_mcp_tools_call(
         call_ctx = EvaluationContext(
             phase=Phase.TOOL_CALL,
             content={"name": namespaced_name, "arguments": arguments},
-            tool_name=namespaced_name,
+            tool_name=_subagent_effective_tool_name(namespaced_name, arguments),
             actor=actor,
         )
         call_result = await engine.evaluate(call_ctx)

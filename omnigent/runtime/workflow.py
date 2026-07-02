@@ -2218,14 +2218,12 @@ def _async_handle_message(task_id: str, tool_name: str) -> str:
 # ── Phase 6: TOOL_CALL / TOOL_RESULT / OUTPUT enforcement ───
 
 
-# Builtin tools that dispatch a sub-agent by its declared
-# ``tools.agents`` name. Listed here so the TOOL_CALL enforcement
-# site can narrow ``tool_name`` to the sub-agent's declared name
-# for ``match_tools`` matching — YAML authors think of a sub-agent
-# as a tool named after its ``tools.agents`` entry, not as a call
-# to the generic spawn / send builtin. Names come from the tool
-# classes' ``.name()`` classmethods so a rename in one of them
-# can't silently desync this constant.
+# Sub-agent tool-name resolution: when ``sys_session_send`` is called,
+# the TOOL_CALL enforcement sites in ``sessions.py`` narrow the
+# effective tool name to the sub-agent's declared name (``args["agent"]``)
+# so that ``match_tools:[worker]`` / ``tool_call:worker`` policies fire as
+# the YAML author intended. See ``_subagent_effective_tool_name`` in
+# ``omnigent/server/routes/sessions.py``.
 
 
 def _find_latest_compaction_item(
