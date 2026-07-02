@@ -92,7 +92,7 @@ jobs:
     # all shards concurrently so one wedged shard can't block the others.
     # -n 2 per shard => 4 x 2 = 8 concurrent gateway calls, below the
     # nightly's 429 pain point; drop -n before max-parallel if rate-limited.
-    name: E2E Tests (shard ${{ matrix.shard_id }}/${{ matrix.num_shards }})
+    name: E2E Tests
     # Draft PRs resolve to an EMPTY matrix in `setup`, so no shard runs for
     # them. Fork PRs DO run (mock LLM, no secrets) -- same as ci.yml.
     needs: setup
@@ -122,7 +122,7 @@ jobs:
       - name: Run e2e suite
         uses: ./.github/actions/e2e-run
         with:
-          shard_id: ${{ matrix.shard_id }}
-          num_shards: ${{ matrix.num_shards }}
+          shard_id: ${{ strategy.job-index }}
+          num_shards: ${{ strategy.job-total }}
           parallelism: ${{ github.event.inputs.parallelism || '2' }}
           nightly_full: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}

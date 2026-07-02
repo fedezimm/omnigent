@@ -134,7 +134,7 @@ jobs:
           retention-days: 1
 
   e2e-ui:
-    name: E2E UI Tests (shard ${{ matrix.shard_id }}/${{ matrix.num_shards }})
+    name: E2E UI Tests
     # Draft PRs resolve to an EMPTY matrix in `setup`, so no shard runs for
     # them. Fork PRs DO run (mock LLM, no secrets) -- same as ci.yml.
     # `ready_for_review` re-fires when a draft is converted.
@@ -269,8 +269,8 @@ jobs:
           # Scheduled / manually dispatched runs are the full pass;
           # PR and push runs exclude @pytest.mark.nightly tests.
           NIGHTLY_FULL: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
-          SHARD_ID: ${{ matrix.shard_id }}
-          NUM_SHARDS: ${{ matrix.num_shards }}
+          SHARD_ID: ${{ strategy.job-index }}
+          NUM_SHARDS: ${{ strategy.job-total }}
           # Prebuilt sidecar from build-sidecar; the codex goal-mode fixture
           # uses this instead of running cargo build. Absolute path: the
           # fixture runs with cwd at the repo root but be explicit.
@@ -306,7 +306,7 @@ jobs:
         with:
           # Shard suffix avoids the matrix's parallel uploads colliding (v4
           # 409s on dupe names).
-          name: e2e-ui-playwright-${{ github.run_id }}-shard${{ matrix.shard_id }}
+          name: e2e-ui-playwright-${{ github.run_id }}-shard${{ strategy.job-index }}
           # `playwright-report/` is the JS-runner's HTML dir, never produced
           # by pytest-playwright -- kept for forward-compat (ignore-if-absent).
           path: |
@@ -339,7 +339,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
-          name: e2e-ui-server-logs-${{ github.run_id }}-shard${{ matrix.shard_id }}
+          name: e2e-ui-server-logs-${{ github.run_id }}-shard${{ strategy.job-index }}
           # server.log + runner.log from the live_server fixture's tmp dir,
           # plus the native bridge dirs and the Claude / Codex transcripts
           # staged above -- all needed to triage a native render-parity failure.

@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Emits the e2e shard matrix as `matrix=<json>` on $GITHUB_OUTPUT, or an EMPTY
-# matrix ({"include":[]}) to skip. Empty yields zero jobs and thus NO check-runs
-# -- the point of the indirection: a job-level `if:` skip would instead leave a
-# check-run with an unexpanded `E2E Tests (shard ${{ matrix.shard_id }}/...)` name.
+# matrix ({"include":[]}) to skip. Empty yields zero jobs and thus NO check-runs.
+# Each entry carries only a human-readable `shard` label ("shard 0/N"); the job
+# uses strategy.job-index / strategy.job-total for the actual shard index so the
+# display name (e.g. "E2E Tests (shard 0/4)") stays clean even on skipped runs.
 #
 # Skips only draft PRs. These suites are mock-LLM (no secrets), so fork PRs run
 # directly, like CI.
@@ -25,7 +26,7 @@ fi
 
 inc=""
 for ((i = 0; i < NUM_SHARDS; i++)); do
-  inc+="{\"shard_id\":$i,\"num_shards\":$NUM_SHARDS},"
+  inc+="{\"shard\":\"shard $i/$NUM_SHARDS\"},"
 done
 echo "matrix={\"include\":[${inc%,}]}" >> "$GITHUB_OUTPUT"
 echo "run: $NUM_SHARDS shards (event=$EVENT_NAME)"
