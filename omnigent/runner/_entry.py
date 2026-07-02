@@ -431,11 +431,13 @@ def _make_managed_mint_factory(
         ``"https://omnigent.example.com"``.
     :param binding_token: The runner's tunnel binding token (the sandbox's
         only credential), presented to the mint endpoint.
-    :returns: A sync callable returning a fresh owner JWT, or ``None`` when
-        the initial probe mint fails (e.g. a no-auth server that refuses to
-        mint) — the runner then sends unauthenticated requests, as it did
-        before this fallback existed, instead of holding a factory that
-        raises on every call.
+    :returns: A sync callable returning a fresh owner JWT, or ``None`` only
+        when the server *definitively* will not mint for this runner (HTTP
+        400 no-auth/header mode, or 404 older server without the endpoint) —
+        the runner then sends unauthenticated requests, as it did before this
+        fallback existed. A *transient* probe failure still installs the
+        factory, which re-mints on the next callback (so a blip at boot does
+        not leave the runner unauthenticated until process restart).
     """
     from omnigent.runner.identity import token_bound_runner_id
 
@@ -462,13 +464,23 @@ def _make_managed_mint_factory(
         cached_expires_at = expires_at
         return token
 
-    # Probe once at construction — this first call IS the first mint. A
-    # success installs the factory seeded with that cached token; any
-    # failure (notably a no-auth server that refuses to mint, or an
-    # unreachable endpoint) yields None so the runner sends bare requests
-    # exactly as before, rather than a factory that raises on every call.
-    if _factory() is None:
-        return None
+    # Construction probe. Decline to install the factory ONLY when the
+    # server definitively will not mint for this runner — HTTP 400 (no auth
+    # provider / header mode) or 404 (an older server without the endpoint).
+    # There the runner falls back to bare requests, which are correct on a
+    # no-auth server. Every other outcome installs the factory: a success
+    # seeds the cache; a transient failure (network blip, 5xx, timeout)
+    # installs it anyway so the next callback re-mints, rather than leaving
+    # the runner unauthenticated until process restart.
+    try:
+        cached_token, cached_expires_at = _mint_managed_owner_token(
+            mint_url, server_url, binding_token
+        )
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code in (400, 404):
+            return None
+    except (httpx.HTTPError, ValueError, KeyError, OSError):
+        pass
     return _factory
 
 

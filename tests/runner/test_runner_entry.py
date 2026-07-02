@@ -315,27 +315,83 @@ def test_managed_mint_factory_serves_cached_token_when_refresh_fails(
     assert len(calls) == 2
 
 
-def test_managed_mint_factory_probe_failure_installs_no_factory(
+def test_managed_mint_factory_no_factory_when_server_definitively_refuses(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """If the construction probe can't mint, no factory is installed.
+    """A definitive no-mint (HTTP 400/404) installs no factory → bare requests.
 
-    A failing initial mint (e.g. a no-auth server that refuses to mint, or
-    the endpoint unreachable at boot) yields ``None`` — the runner then
-    sends bare requests instead of holding a factory that raises on every
-    call.
+    HTTP 400 (no auth provider / header mode) and 404 (an older server
+    without the endpoint) mean the server will never mint for this runner,
+    so the runner must fall back to unauthenticated requests — correct on a
+    no-auth server. No factory is installed.
 
     :param monkeypatch: Pytest environment patch fixture.
     :returns: None.
     """
 
+    def _refuses(mint_url: str, server_url: str, binding_token: str) -> tuple[str, float]:
+        """Reject the mint the way a no-auth / header-mode server does (400)."""
+        request = httpx.Request("POST", mint_url)
+        raise httpx.HTTPStatusError(
+            "unsupported", request=request, response=httpx.Response(400, request=request)
+        )
+
+    monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _refuses)
+
+    assert _make_managed_mint_factory("https://s.example.com", "btok") is None
+
+
+def test_managed_mint_factory_installs_for_retry_on_transient_boot_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transient probe failure still installs the factory (armed to retry).
+
+    If the mint endpoint has a blip at the instant the runner boots (network
+    error, 5xx), the factory must still install so a later callback re-mints
+    — otherwise the runner is left permanently unauthenticated until process
+    restart.
+
+    :param monkeypatch: Pytest environment patch fixture.
+    :returns: None.
+    """
+
+    def _blip(mint_url: str, server_url: str, binding_token: str) -> tuple[str, float]:
+        """A transient failure — the endpoint is momentarily unreachable."""
+        raise httpx.ConnectError("mint endpoint unreachable at boot")
+
+    monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _blip)
+
+    factory = _make_managed_mint_factory("https://s.example.com", "btok")
+    assert factory is not None  # installed despite the boot blip
+    assert factory() is None  # still can't mint, but it's armed to retry
+
+
+def test_managed_mint_factory_recovers_after_transient_boot_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After a transient boot blip, the factory re-mints on the next call.
+
+    Locks in the recovery guarantee: a one-time failure at construction does
+    not disable auth — the very next callback mints successfully.
+
+    :param monkeypatch: Pytest environment patch fixture.
+    :returns: None.
+    """
+    calls: list[int] = []
+
     def _fake_mint(mint_url: str, server_url: str, binding_token: str) -> tuple[str, float]:
-        """Always fail — the mint endpoint is unreachable."""
-        raise httpx.ConnectError("mint endpoint unreachable")
+        """Fail the boot probe once, then mint successfully."""
+        calls.append(1)
+        if len(calls) == 1:
+            raise httpx.ConnectError("boot blip")
+        return ("jwt-recovered", time.time() + 1800)
 
     monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _fake_mint)
 
-    assert _make_managed_mint_factory("https://s.example.com", "btok") is None
+    factory = _make_managed_mint_factory("https://s.example.com", "btok")
+    assert factory is not None  # installed despite the boot-probe failure
+    assert factory() == "jwt-recovered"  # first real callback re-mints
+    assert len(calls) == 2  # probe (failed) + successful re-mint
 
 
 def test_mint_managed_owner_token_posts_binding_token_and_parses_response(
