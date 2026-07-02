@@ -28,6 +28,7 @@ from tests.harness_bench.bench import run_bench
 from tests.harness_bench.manifest import OFFICIAL_PROFILES
 from tests.harness_bench.profile import BenchProfile, resolve_profile
 from tests.harness_bench.report import render_json, render_markdown, render_table
+from tests.harness_bench.transport import driver_registry
 
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:
@@ -103,6 +104,15 @@ def main(argv: list[str] | None = None) -> int:
         profiles = _resolve_profiles(args.harness)
     except KeyError as exc:
         print(str(exc), file=sys.stderr)
+        return 2
+
+    # Validate the transport override up front so a typo is a clean CLI error
+    # (exit 2) rather than a KeyError traceback out of the async run.
+    if args.transport is not None and args.transport not in driver_registry():
+        known = ", ".join(sorted(driver_registry()))
+        print(
+            f"unknown --transport {args.transport!r}; known transports: {known}", file=sys.stderr
+        )
         return 2
 
     # Live if explicitly forced, or implied by a supplied profile.

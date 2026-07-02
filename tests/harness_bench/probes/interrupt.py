@@ -45,6 +45,15 @@ class InterruptProbe(CapabilityProbe):
         # No confirmed cancel. The wrap path posts the interrupt on the FIRST
         # text delta, so a turn that emitted no text and then terminated did
         # not exercise the interrupt at all — unmeasurable, not a failure.
+        #
+        # Measurement gap: the full-server driver confirms an interrupt via the
+        # cancellation marker (handled above) and never populates
+        # text_delta_count, so a full-server harness that *ignores* an
+        # interrupt can only be caught as UNSUPPORTED via timed_out below —
+        # otherwise it settles here as SKIPPED (unmeasurable), not a negative
+        # result. Honored interrupts (the probe's goal) are measured on both
+        # transports; a full-server negative needs a delta signal on that
+        # transport to become UNSUPPORTED rather than SKIPPED.
         if result.text_delta_count == 0:
             infra = infra_failure_reason(result)
             note = infra or "turn produced no text before terminating; interrupt not exercised"

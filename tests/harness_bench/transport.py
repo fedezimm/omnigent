@@ -27,13 +27,12 @@ Transport selection: each :class:`BenchProfile` declares a default
 
 from __future__ import annotations
 
-from typing import Protocol, runtime_checkable
+from typing import Protocol
 
 from tests.harness_bench.driver import TurnResult
 from tests.harness_bench.profile import BenchProfile
 
 
-@runtime_checkable
 class Driver(Protocol):
     """The probe-facing driver contract.
 
@@ -41,38 +40,42 @@ class Driver(Protocol):
     transport (spawns a wrap subprocess, or a server+runner) and binds a
     session; ``__aexit__`` tears it down. Each ``run_*`` method drives one
     turn and returns a :class:`TurnResult` the probes interpret.
+
+    Not ``@runtime_checkable`` on purpose: drivers are selected by class from
+    :func:`driver_registry`, never by ``isinstance`` — and a runtime protocol
+    check would not cover the data/static members (``transport``,
+    ``unavailable``) anyway. The docstring-only method bodies below are the
+    Protocol stub form; the concrete drivers supply the behavior.
     """
 
     transport: str
 
-    async def __aenter__(self) -> Driver: ...
-    async def __aexit__(self, *exc: object) -> None: ...
+    async def __aenter__(self) -> Driver:
+        """Provision the transport and bind a session."""
+
+    async def __aexit__(self, *exc: object) -> None:
+        """Tear down the transport."""
 
     async def run_basic_turn(self, marker: str) -> TurnResult:
         """Plain turn asking the model to echo *marker*. Used by basic_turn
         and model_override."""
-        ...
 
     async def run_streaming_turn(self) -> TurnResult:
         """A multi-token turn; the result's ``text_delta_count`` reflects
         whether the transport streamed token-level deltas."""
-        ...
 
     async def run_tool_turn(self, *, deny: bool) -> TurnResult:
         """Provoke a tool call. With *deny*, a tool-call policy DENY is in
         force so the call should be blocked (``tool_call_denied``); otherwise
         the call is dispatched and answered (``tool_calls`` populated)."""
-        ...
 
     async def run_interrupt_turn(self) -> TurnResult:
         """Start a long turn and interrupt it mid-flight; ``cancelled``
         reflects whether the transport honored the interrupt."""
-        ...
 
     @staticmethod
     def unavailable(profile: BenchProfile, *, databricks_profile: str | None) -> str | None:
         """Return a skip reason if this driver cannot run *profile*, else None."""
-        ...
 
 
 def driver_registry() -> dict[str, type]:
