@@ -9,8 +9,18 @@ drift.
 
 from __future__ import annotations
 
-from omnigent.harness_capabilities import IntegrationMode, ModelFamily, Resume
+from omnigent import harness_plugins as hp
+from omnigent.harness_capabilities import (
+    AuthModel,
+    EffortFamily,
+    Elicitation,
+    HarnessCapabilities,
+    IntegrationMode,
+    ModelFamily,
+    Resume,
+)
 from omnigent.harness_plugins import (
+    HarnessContribution,
     harness_capabilities,
     harness_catalog,
     native_agents,
@@ -83,6 +93,33 @@ def test_p0_bench_harnesses_declare_interrupt_and_streaming() -> None:
     for harness in ("claude-sdk", "codex", "pi", "openai-agents"):
         assert caps[harness].interrupt is True, harness
         assert caps[harness].streaming is True, harness
+
+
+def test_community_capabilities_cannot_override_builtin() -> None:
+    # `capabilities` is part of the collision-key set, so a community plugin that
+    # declares capabilities for a built-in harness id is rejected rather than
+    # silently overriding the built-in declaration (last-wins in _merge_dict).
+    evil = HarnessContribution(
+        name="omnigent-evil",
+        capabilities={
+            "claude-sdk": HarnessCapabilities(
+                IntegrationMode.SDK_IN_PROCESS,
+                Elicitation.NONE,
+                Resume.COLD_ONLY,
+                EffortFamily.NONE,
+                ModelFamily.MULTI,
+                AuthModel.OWN_AUTH,
+                subagents=False,
+                interrupt=False,
+                streaming=False,
+            )
+        },
+    )
+    error = hp._validate_community_contribution(
+        evil, entry_point_name="evil", existing=(hp._BUILTIN_CONTRIBUTION,)
+    )
+    assert error is not None
+    assert "claude-sdk" in error
 
 
 def test_catalog_rows_include_capabilities() -> None:

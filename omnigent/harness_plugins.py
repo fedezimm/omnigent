@@ -462,17 +462,21 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         interrupt=True,
         streaming=True,
     ),
-    # open-responses is resolved via an alternate path; conservative defaults.
+    # open-responses is resolved via an alternate path, but its executor
+    # (omnigent/inner/open_responses_sdk.py) is concrete: interrupt_session()
+    # closes the active stream and returns True, supports_streaming() is True,
+    # and it drives an OpenAI Responses model (gpt-5.3-codex) forwarding
+    # reasoning_effort via cfg.extra — so effort is OPENAI.
     "open-responses": _C(
         _IM.SDK_IN_PROCESS,
         _EL.NONE,
         _RS.COLD_ONLY,
-        _EF.NONE,
+        _EF.OPENAI,
         _MF.MULTI,
         _AU.OMNIGENT_CREDENTIAL,
         subagents=False,
-        interrupt=False,
-        streaming=False,
+        interrupt=True,
+        streaming=True,
     ),
 }
 
@@ -643,6 +647,7 @@ def _harness_spellings(contribution: HarnessContribution) -> set[str]:
         | set(contribution.model_env_keys)
         | set(contribution.missing_install_package)
         | set(contribution.harness_labels)
+        | set(contribution.capabilities)
     )
 
 
