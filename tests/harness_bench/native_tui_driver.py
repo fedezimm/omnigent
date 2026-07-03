@@ -33,10 +33,12 @@ records, so adding a harness is a config entry, not a new driver — until a
 vendor diverges in kind (codex-native is RPC-delivered; opencode-native is
 ``native-server`` not ``native-tui``), which will want its own handling.
 
-Scope: this skeleton wires **claude-native** and the shared turn/observe
-path. It is structurally complete and offline-tested, but was NOT
-live-verified in the authoring environment (no interactive vendor login
-available); the gated live test runs it where a login exists.
+Scope: this driver ships **claude-native**, live-verified end to end (basic
+turn, delta streaming, model override, interrupt — no drift) on a host with
+the ``claude`` CLI logged in. codex-native is wired as a vendor entry for
+opt-in but not shipped as an official profile: its app-server RPC delivery
+is not observable on the shared session stream (see ``_VENDORS``), so its
+turns run without surfacing text — RPC-delivery observation is a follow-up.
 """
 
 from __future__ import annotations
@@ -114,13 +116,17 @@ class NativeVendor:
     own_auth: bool = False
 
 
-# Vendor registry. Both entries are OMNIGENT_CREDENTIAL vendors the bench can
-# run (given the vendor CLI is logged in on the host). Delivery differs under
-# the hood — claude-native is tmux-paste, codex-native is app-server RPC — but
-# the bench only touches the shared session HTTP surface (POST events / SSE /
-# item polling), which the runner drives identically for both; the RPC-vs-tmux
-# split lives entirely runner-side. OWN_AUTH natives are intentionally absent
-# (the bench cannot provision their login).
+# Vendor registry. Both entries are OMNIGENT_CREDENTIAL vendors, but only
+# claude-native is observable by this driver today: its output surfaces on the
+# shared session HTTP stream (POST events / SSE / item polling) because its
+# delivery is tmux-paste. codex-native delivers via app-server RPC, so a turn
+# runs (in_progress → completed) without emitting text deltas or persisting an
+# assistant item on that stream — the shared observe path sees nothing. Its
+# entry stays here so `--harness codex-native --transport native-tui` resolves
+# and skip-gates cleanly rather than crashing, but it is intentionally left out
+# of the shipped OFFICIAL_PROFILES (see manifest) until RPC-delivery
+# observation is wired. OWN_AUTH natives are absent (login the bench cannot
+# provision).
 _VENDORS: dict[str, NativeVendor] = {
     "claude-native": NativeVendor("claude-native", "claude-native-ui", own_auth=False),
     "codex-native": NativeVendor("codex-native", "codex-native-ui", own_auth=False),
