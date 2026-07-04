@@ -178,9 +178,13 @@ Redeploy to apply. For Google Workspace, also set
   launches) return **409 "host is offline"** even though the host is
   connected. Retrying rides it out (~1-in-N odds per attempt at N warm
   instances), and instances converge back to one after ~5 quiet minutes.
-  There is no single-instance pin on Vercel (unlike Modal's
-  `max_containers=1`); this is the target's fundamental ceiling and why
-  it's rated demo-grade.
+  A single-instance pin does not exist on Vercel on any plan (the
+  operator-controllable knobs stop at max duration / region / memory;
+  scaling is automatic and routing prefers the least-loaded instance) —
+  unlike Modal's `max_containers=1`. Vercel's own guidance for this
+  shape of app is to externalize connection state to marketplace Redis;
+  until Omnigent grows cross-instance tunnel routing, this is the
+  target's fundamental ceiling and why it's rated demo-grade.
 - **No persistent disk.** Postgres is required (no SQLite lite tier), the
   cookie secret must be pinned via env, and artifacts **must** live in an
   S3-compatible bucket.

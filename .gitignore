@@ -82,3 +82,4 @@ deploy/databricks/.databricks/
 # installs write (holds live DATABASE_URL / BLOB_READ_WRITE_TOKEN secrets).
 .vercel
 .env.local
+.env*
