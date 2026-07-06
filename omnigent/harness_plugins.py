@@ -256,6 +256,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         interrupt=True,
         streaming=True,
     ),
+    # streaming=False is LIVE-VERIFIED: a bench run observed 0 text deltas.
     "cursor-native": _C(
         _IM.NATIVE_TUI,
         _EL.APPROVAL_MIRROR,
@@ -265,7 +266,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         _AU.OWN_AUTH,
         subagents=False,
         interrupt=True,
-        streaming=True,
+        streaming=False,
     ),
     # kiro_native_permissions.py: "TUI ACP recorder -> web elicitation".
     # streaming=False is LIVE-VERIFIED: a full SSE capture recorded 0 text
@@ -303,6 +304,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         interrupt=True,
         streaming=True,
     ),
+    # streaming=False is LIVE-VERIFIED: a bench run observed 0 text deltas.
     "qwen-native": _C(
         _IM.NATIVE_TUI,
         _EL.APPROVAL_MIRROR,
@@ -312,7 +314,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         _AU.OWN_AUTH,
         subagents=False,
         interrupt=True,
-        streaming=True,
+        streaming=False,
     ),
     "kimi-native": _C(
         _IM.NATIVE_TUI,
