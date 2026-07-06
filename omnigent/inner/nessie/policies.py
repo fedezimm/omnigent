@@ -11,5 +11,6 @@ from omnigent.policies.builtins.orchestration import POLICY_REGISTRY as _new_reg
 _OLD = "omnigent.inner.nessie.policies."
 _NEW = "omnigent.policies.builtins.orchestration."
 POLICY_REGISTRY = [
-    {**entry, "handler": entry["handler"].replace(_NEW, _OLD)} for entry in _new_registry
+    {**entry, "handler": entry["handler"].replace(_NEW, _OLD), "internal_only": True}
+    for entry in _new_registry
 ]
