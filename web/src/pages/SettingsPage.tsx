@@ -308,7 +308,21 @@ function UiFontFamilyControl() {
           Use any font installed on this device. Leave blank for the system default.
         </span>
       </div>
+      {/* Reset sits left of the input so the input is the rightmost element and
+          its right edge lines up flush with the font-size stepper above.
+          `invisible` (not removed) at the default keeps the row from shifting. */}
       <div role="group" aria-label="Font family" className="flex shrink-0 items-center gap-2">
+        <Button
+          type="button"
+          variant="ghost"
+          size="sm"
+          data-testid="ui-font-family-reset"
+          disabled={isDefault}
+          className={cn("h-9", isDefault && "invisible")}
+          onClick={() => update(UI_FONT_FAMILY_DEFAULT)}
+        >
+          Reset
+        </Button>
         <Input
           type="text"
           aria-label="UI font family"
@@ -321,18 +335,6 @@ function UiFontFamilyControl() {
           value={family}
           onChange={(e) => update(e.target.value)}
         />
-        <Button
-          type="button"
-          variant="ghost"
-          size="sm"
-          data-testid="ui-font-family-reset"
-          // Nothing to reset at the default; hidden keeps the row tidy.
-          disabled={isDefault}
-          className={cn("h-9", isDefault && "invisible")}
-          onClick={() => update(UI_FONT_FAMILY_DEFAULT)}
-        >
-          Reset
-        </Button>
       </div>
     </div>
   );
