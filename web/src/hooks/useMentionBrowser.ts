@@ -1,6 +1,7 @@
 import { type KeyboardEvent, type RefObject, useRef, useState } from "react";
 
 import { type MentionItem, type MentionState } from "@/lib/composerMentions";
+import { matchesCommand } from "@/lib/keymap";
 import { composerAttachmentKey } from "@/store/chatStore";
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
 
@@ -124,12 +125,12 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
   const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>): boolean => {
     if (!mentionOpen) return false;
     const active = mentionIndex >= 0 ? mentionEntries[mentionIndex] : undefined;
-    if (e.key === "ArrowDown") {
+    if (matchesCommand("mention-navigate-down", e)) {
       e.preventDefault();
       setMentionIndex((i) => (i + 1) % mentionEntries.length);
       return true;
     }
-    if (e.key === "ArrowUp") {
+    if (matchesCommand("mention-navigate-up", e)) {
       e.preventDefault();
       setMentionIndex((i) => (i <= 0 ? mentionEntries.length - 1 : i - 1));
       return true;
@@ -142,12 +143,12 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
       else attachMention(active.path, false);
       return true;
     }
-    if (e.key === "Tab" && active) {
+    if (active && matchesCommand("mention-apply", e)) {
       e.preventDefault();
       attachMention(active.path, active.type === "directory");
       return true;
     }
-    if (e.key === "Escape") {
+    if (matchesCommand("mention-dismiss", e)) {
       e.preventDefault();
       dismiss();
       return true;

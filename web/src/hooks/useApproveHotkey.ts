@@ -16,14 +16,13 @@
 import { useEffect } from "react";
 
 import type { ElicitationBlock } from "@/lib/blocks";
+import { matchesCommand } from "@/lib/keymap";
 import { useChatStore } from "@/store/chatStore";
 
 export function useApproveHotkey(): void {
   useEffect(() => {
     const handler = (e: globalThis.KeyboardEvent): void => {
-      // Cmd/Ctrl, not Alt/Shift (mirrors the session-switch hotkey's guard).
-      if (!(e.metaKey || e.ctrlKey) || e.altKey || e.shiftKey) return;
-      if (e.key !== "Enter") return;
+      if (!matchesCommand("accept-approval", e)) return;
 
       const { blocks, submitApproval } = useChatStore.getState();
       // Newest-first: accept the most recent still-pending prompt that takes a

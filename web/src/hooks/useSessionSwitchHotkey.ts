@@ -5,6 +5,7 @@
 
 import { useEffect, useRef } from "react";
 import { useNavigate } from "@/lib/routing";
+import { matchesCommand } from "@/lib/keymap";
 
 /**
  * @param orderedIds Conversation ids in sidebar render order, visible sections
@@ -23,15 +24,15 @@ export function useSessionSwitchHotkey(
 
   useEffect(() => {
     const handler = (e: globalThis.KeyboardEvent): void => {
-      // Cmd/Ctrl, not Alt (Alt+arrow is the message hotkey); Shift left to selection.
-      if (!(e.metaKey || e.ctrlKey) || e.altKey || e.shiftKey) return;
-      if (e.key !== "ArrowUp" && e.key !== "ArrowDown") return;
+      const isUp = matchesCommand("previous-session", e);
+      const isDown = matchesCommand("next-session", e);
+      if (!isUp && !isDown) return;
 
       const { orderedIds: ids, activeId: active } = latest.current;
       if (ids.length === 0) return;
 
       e.preventDefault(); // also suppresses the native caret-to-start/end in fields
-      const dir = e.key === "ArrowDown" ? 1 : -1;
+      const dir = isDown ? 1 : -1;
       const current = active ? ids.indexOf(active) : -1;
       // Off-list: ↓ enters at the top, ↑ at the bottom. Otherwise step + wrap.
       const next =

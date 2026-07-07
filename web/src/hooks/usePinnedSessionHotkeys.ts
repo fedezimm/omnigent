@@ -12,27 +12,13 @@
 
 import { useEffect, useRef } from "react";
 import { useNavigate } from "@/lib/routing";
-import { isNativeShell } from "@/lib/nativeBridge";
+import {
+  PINNED_HOTKEY_CODES,
+  PINNED_HOTKEY_DIGITS,
+  pinnedSessionIndexFromEvent,
+} from "@/lib/keymap";
 
-/** Index → the digit key that selects it (native path; matched against e.key).
- *  Single source of truth shared with the shortcuts dialog so binding and label
- *  can't drift. */
-export const PINNED_HOTKEY_DIGITS = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"] as const;
-
-/** Index → the physical key code (browser path; matched against e.code, since
- *  Alt rewrites e.key on macOS). Same order as {@link PINNED_HOTKEY_DIGITS}. */
-export const PINNED_HOTKEY_CODES = [
-  "Digit1",
-  "Digit2",
-  "Digit3",
-  "Digit4",
-  "Digit5",
-  "Digit6",
-  "Digit7",
-  "Digit8",
-  "Digit9",
-  "Digit0",
-] as const;
+export { PINNED_HOTKEY_CODES, PINNED_HOTKEY_DIGITS };
 
 /**
  * @param orderedPinnedIds Pinned conversation ids in sidebar render order
@@ -50,25 +36,7 @@ export function usePinnedSessionHotkeys(
 
   useEffect(() => {
     const handler = (e: globalThis.KeyboardEvent): void => {
-      // Cmd/Ctrl required; Shift left to other bindings.
-      if (e.shiftKey || !(e.metaKey || e.ctrlKey)) return;
-
-      let index: number;
-      if (isNativeShell()) {
-        // Desktop owns plain Cmd/Ctrl+digit (Alt+chord is the message hotkey).
-        if (e.altKey) return;
-        index = PINNED_HOTKEY_DIGITS.indexOf(e.key as (typeof PINNED_HOTKEY_DIGITS)[number]);
-      } else {
-        // Browser: plain Cmd/Ctrl+digit is the native tab-switch, so own the
-        // Cmd/Ctrl+Alt+digit chord instead. Alt rewrites e.key → match e.code.
-        if (!e.altKey) return;
-        // AltGr reports as Ctrl+Alt on Windows/Linux intl layouts — typing
-        // AltGr+digit must compose the character, not yank the user to a
-        // pinned session. Same guard (and same feature-detect, so synthetic
-        // events without the method don't throw) as useSidebarToggleHotkeys.
-        if (typeof e.getModifierState === "function" && e.getModifierState("AltGraph")) return;
-        index = PINNED_HOTKEY_CODES.indexOf(e.code as (typeof PINNED_HOTKEY_CODES)[number]);
-      }
+      const index = pinnedSessionIndexFromEvent(e);
       if (index === -1) return;
 
       const { orderedPinnedIds: ids, activeId: active } = latest.current;

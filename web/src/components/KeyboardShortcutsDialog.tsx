@@ -18,6 +18,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { getShortcutGroups, matchesCommand, modKeyLabel } from "@/lib/keymap";
 import { isNativeShell } from "@/lib/nativeBridge";
 
 // Custom event the dialog listens for, so non-adjacent surfaces (e.g. the
@@ -30,101 +31,8 @@ export function openKeyboardShortcuts(): void {
   window.dispatchEvent(new Event(KEYBOARD_SHORTCUTS_EVENT));
 }
 
-// Platform-aware modifier glyphs. macOS shows ⌘/⌥; elsewhere Ctrl/Alt — the
-// same split the underlying handlers use (`metaKey || ctrlKey`).
-const IS_MAC =
-  typeof navigator !== "undefined" &&
-  /Mac|iPhone|iPad|iPod/i.test(navigator.platform || navigator.userAgent || "");
-
 /** Modifier label shown in menu hints (⌘ on macOS, Ctrl elsewhere). */
-export const MOD_KEY = IS_MAC ? "⌘" : "Ctrl";
-
-// Glyphs match the in-app tooltips (e.g. UserMessageNav's "⌘⌥↑").
-const ENTER = "↵";
-const SHIFT = "⇧";
-const ALT = IS_MAC ? "⌥" : "Alt";
-const UP = "↑";
-const DOWN = "↓";
-
-interface Shortcut {
-  label: string;
-  /** Keys rendered left→right as chips. A chord (held together) or, for the
-   *  arrow-pairs, the two interchangeable keys for that action. */
-  keys: string[];
-}
-
-interface ShortcutGroup {
-  title: string;
-  /** Optional qualifier shown next to the group title. */
-  note?: string;
-  items: Shortcut[];
-}
-
-// ONLY shortcuts that exist today (see file header). Keep in sync with the
-// composer's `handleKeyDown` and the global hotkey hooks.
-const SHORTCUT_GROUPS: ShortcutGroup[] = [
-  {
-    title: "General",
-    items: [
-      { label: "Open command palette", keys: [MOD_KEY, "K"] },
-      { label: "Show keyboard shortcuts", keys: [MOD_KEY, "/"] },
-    ],
-  },
-  {
-    title: "In chats",
-    items: [
-      { label: "Send message", keys: [ENTER] },
-      { label: "New line in message", keys: [SHIFT, ENTER] },
-      { label: "Recall previous prompt", keys: [UP] },
-      { label: "Recall next prompt", keys: [DOWN] },
-      { label: "Accept approval prompt", keys: [MOD_KEY, ENTER] },
-      { label: "Stop response", keys: ["Esc"] },
-    ],
-  },
-  {
-    title: "Navigation",
-    items: [
-      { label: "Previous session", keys: [MOD_KEY, UP] },
-      { label: "Next session", keys: [MOD_KEY, DOWN] },
-    ],
-  },
-  {
-    title: "View",
-    items: [
-      { label: "Toggle conversations sidebar", keys: [MOD_KEY, ALT, "["] },
-      { label: "Toggle workspace sidebar", keys: [MOD_KEY, ALT, "]"] },
-    ],
-  },
-  {
-    title: "Slash commands",
-    note: "while the suggestions menu is open",
-    items: [
-      { label: "Navigate suggestions", keys: [UP, DOWN] },
-      { label: "Apply highlighted command", keys: ["Tab"] },
-      { label: "Dismiss menu", keys: ["Esc"] },
-    ],
-  },
-];
-
-// Numeric pinned-session jump. The chord is platform-aware (see
-// usePinnedSessionHotkeys): plain Cmd/Ctrl+digit in the Electron shell, but
-// Cmd/Ctrl+Alt+digit in a browser tab, where plain Cmd+digit is reserved for
-// native tab-switching. Shown in both, with the matching glyphs.
-function pinnedSessionShortcut(native: boolean): Shortcut {
-  return {
-    label: "Jump to pinned session (1–10)",
-    keys: native ? [MOD_KEY, "1…0"] : [MOD_KEY, ALT, "1…0"],
-  };
-}
-
-/** Shortcut groups for the current runtime — the pinned-jump chord differs by shell. */
-function shortcutGroupsFor(native: boolean): ShortcutGroup[] {
-  return SHORTCUT_GROUPS.map((group) =>
-    group.title === "Navigation"
-      ? { ...group, items: [...group.items, pinnedSessionShortcut(native)] }
-      : group,
-  );
-}
+export const MOD_KEY = modKeyLabel();
 
 function Kbd({ children }: { children: ReactNode }) {
   return (
@@ -140,8 +48,7 @@ function Kbd({ children }: { children: ReactNode }) {
  * Settings page, which embeds it directly instead of behind a trigger.
  */
 export function KeyboardShortcutsList() {
-  // Feature-based, stable per session; computed at render so tests can vary it.
-  const groups = shortcutGroupsFor(isNativeShell());
+  const groups = getShortcutGroups(isNativeShell());
   return (
     <>
       {groups.map((group) => (
@@ -178,9 +85,7 @@ export function KeyboardShortcutsDialog() {
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
-      // ⌘/Ctrl + / toggles the panel. Plain `/` is the composer's slash-menu
-      // trigger, so require the modifier and no Shift/Alt to avoid clashing.
-      if ((e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey && e.key === "/") {
+      if (matchesCommand("show-keyboard-shortcuts", e)) {
         e.preventDefault();
         setOpen((prev) => !prev);
       }

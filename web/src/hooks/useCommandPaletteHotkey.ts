@@ -13,17 +13,14 @@
 
 import { useEffect, useRef } from "react";
 
+import { matchesCommand } from "@/lib/keymap";
+
 /** Selector for surfaces that own ⌘K and must keep it (terminals, code editor). */
 const HOTKEY_OWNING_SURFACES = ".xterm, .monaco-editor";
 
 /** True when the event is the command-palette chord: Cmd/Ctrl+K, no Alt/Shift. */
 export function isCommandPaletteHotkey(e: globalThis.KeyboardEvent): boolean {
-  if (!(e.metaKey || e.ctrlKey) || e.altKey || e.shiftKey) return false;
-  // AltGr reports as Ctrl+Alt on some layouts; the altKey check above already
-  // rejects it, but guard explicitly so intl typing never triggers the palette.
-  if (e.getModifierState("AltGraph")) return false;
-  // Match the letter, not a physical code — ⌘ doesn't remap "k" across layouts.
-  return e.key === "k" || e.key === "K";
+  return matchesCommand("command-palette", e);
 }
 
 /** Does focus sit inside a surface that owns ⌘K (xterm / Monaco)? */
