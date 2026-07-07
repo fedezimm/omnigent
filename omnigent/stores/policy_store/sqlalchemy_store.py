@@ -13,6 +13,7 @@ from omnigent.db.db_models import (
     POLICY_SCOPE_SESSION,
     SqlPolicy,
     current_workspace_id,
+    name_checksum,
 )
 from omnigent.db.utils import (
     get_or_create_engine,
@@ -206,6 +207,7 @@ class SqlAlchemyPolicyStore(PolicyStore):
                     select(SqlPolicy)
                     .where(SqlPolicy.workspace_id == current_workspace_id())
                     .where(SqlPolicy.scope == POLICY_SCOPE_DEFAULT)
+                    .where(SqlPolicy.name_cksum == name_checksum(name))
                     .where(SqlPolicy.name == name)
                 )
                 .scalars()
@@ -260,13 +262,14 @@ class SqlAlchemyPolicyStore(PolicyStore):
             changed = False
             if name is not None and row.name != name:
                 # Explicit uniqueness check for the application layer;
-                # the partial index ix_policies_default_name is the
+                # the partial index ix_policies_default_name_cksum is the
                 # DB-layer guard, but checking here gives a cleaner error.
                 conflict = (
                     session.execute(
                         select(SqlPolicy)
                         .where(SqlPolicy.workspace_id == current_workspace_id())
                         .where(SqlPolicy.scope == POLICY_SCOPE_DEFAULT)
+                        .where(SqlPolicy.name_cksum == name_checksum(name))
                         .where(SqlPolicy.name == name)
                         .where(SqlPolicy.id != policy_id)
                     )

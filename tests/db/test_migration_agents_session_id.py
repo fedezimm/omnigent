@@ -11,6 +11,7 @@ from alembic import command
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError
 
+from omnigent.db.db_models import name_checksum
 from omnigent.db.utils import (
     _build_alembic_config,
     clear_engine_cache,
@@ -56,10 +57,11 @@ def test_ix_conversations_agent_id_added(db_engine: Engine) -> None:
 
 
 def test_agents_name_unique_index_exists(db_engine: Engine) -> None:
-    """ix_agents_template_name unique index must still exist."""
+    """The template-name unique index is on name_cksum at head."""
     indexes = {i["name"]: i for i in sa.inspect(db_engine).get_indexes("agents")}
-    assert "ix_agents_template_name" in indexes
-    assert indexes["ix_agents_template_name"]["unique"]
+    assert "ix_agents_template_name" not in indexes
+    assert "ix_agents_template_name_cksum" in indexes
+    assert indexes["ix_agents_template_name_cksum"]["unique"]
 
 
 def test_template_agent_kind_stored_and_read(db_engine: Engine) -> None:
@@ -67,10 +69,17 @@ def test_template_agent_kind_stored_and_read(db_engine: Engine) -> None:
     with db_engine.begin() as conn:
         conn.execute(
             sa.text(
-                "INSERT INTO agents (id, created_at, name, bundle_location, version, kind)"
-                " VALUES (:id, :ts, :name, :loc, 1, 'template')"
+                "INSERT INTO agents"
+                " (id, created_at, name, name_cksum, bundle_location, version, kind)"
+                " VALUES (:id, :ts, :name, :cksum, :loc, 1, 'template')"
             ),
-            {"id": "ag_tmpl", "ts": 1700000001, "name": "my-template", "loc": "ag_tmpl/bundle"},
+            {
+                "id": "ag_tmpl",
+                "ts": 1700000001,
+                "name": "my-template",
+                "cksum": name_checksum("my-template"),
+                "loc": "ag_tmpl/bundle",
+            },
         )
         kind = conn.execute(
             sa.text("SELECT kind FROM agents WHERE id = :id"), {"id": "ag_tmpl"}
@@ -83,10 +92,17 @@ def test_session_agent_kind_stored_and_read(db_engine: Engine) -> None:
     with db_engine.begin() as conn:
         conn.execute(
             sa.text(
-                "INSERT INTO agents (id, created_at, name, bundle_location, version, kind)"
-                " VALUES (:id, :ts, :name, :loc, 1, 'session')"
+                "INSERT INTO agents"
+                " (id, created_at, name, name_cksum, bundle_location, version, kind)"
+                " VALUES (:id, :ts, :name, :cksum, :loc, 1, 'session')"
             ),
-            {"id": "ag_sess", "ts": 1700000001, "name": "my-session", "loc": "ag_sess/bundle"},
+            {
+                "id": "ag_sess",
+                "ts": 1700000001,
+                "name": "my-session",
+                "cksum": name_checksum("my-session"),
+                "loc": "ag_sess/bundle",
+            },
         )
         kind = conn.execute(
             sa.text("SELECT kind FROM agents WHERE id = :id"), {"id": "ag_sess"}
@@ -99,10 +115,17 @@ def test_agents_session_id_fk_accepts_existing_session(db_engine: Engine) -> Non
     with db_engine.begin() as conn:
         conn.execute(
             sa.text(
-                "INSERT INTO agents (id, created_at, name, bundle_location, version, kind)"
-                " VALUES (:id, :ts, :name, :loc, 1, 'session')"
+                "INSERT INTO agents"
+                " (id, created_at, name, name_cksum, bundle_location, version, kind)"
+                " VALUES (:id, :ts, :name, :cksum, :loc, 1, 'session')"
             ),
-            {"id": "ag_bound", "ts": 1700000001, "name": "bound-agent", "loc": "ag_bound/bundle"},
+            {
+                "id": "ag_bound",
+                "ts": 1700000001,
+                "name": "bound-agent",
+                "cksum": name_checksum("bound-agent"),
+                "loc": "ag_bound/bundle",
+            },
         )
         conn.execute(
             sa.text(
@@ -147,14 +170,16 @@ def test_agents_template_name_unique_index_rejects_duplicate_template(
         with db_engine.begin() as conn:
             conn.execute(
                 sa.text(
-                    "INSERT INTO agents (id, created_at, name, bundle_location, version, kind)"
-                    " VALUES (:id1, :ts, 'dup-template', :loc1, 1, 'template'),"
-                    "        (:id2, :ts, 'dup-template', :loc2, 1, 'template')"
+                    "INSERT INTO agents"
+                    " (id, created_at, name, name_cksum, bundle_location, version, kind)"
+                    " VALUES (:id1, :ts, 'dup-template', :cksum, :loc1, 1, 'template'),"
+                    "        (:id2, :ts, 'dup-template', :cksum, :loc2, 1, 'template')"
                 ),
                 {
                     "id1": "ag_dup1",
                     "id2": "ag_dup2",
                     "ts": 1700000001,
+                    "cksum": name_checksum("dup-template"),
                     "loc1": "ag_dup1/bundle",
                     "loc2": "ag_dup2/bundle",
                 },
@@ -168,14 +193,16 @@ def test_agents_session_id_allows_duplicate_names_for_distinct_sessions(
     with db_engine.begin() as conn:
         conn.execute(
             sa.text(
-                "INSERT INTO agents (id, created_at, name, bundle_location, version, kind)"
-                " VALUES (:id1, :ts, 'shared-name', :loc1, 1, 'session'),"
-                "        (:id2, :ts, 'shared-name', :loc2, 1, 'session')"
+                "INSERT INTO agents"
+                " (id, created_at, name, name_cksum, bundle_location, version, kind)"
+                " VALUES (:id1, :ts, 'shared-name', :cksum, :loc1, 1, 'session'),"
+                "        (:id2, :ts, 'shared-name', :cksum, :loc2, 1, 'session')"
             ),
             {
                 "id1": "ag_s1",
                 "id2": "ag_s2",
                 "ts": 1700000001,
+                "cksum": name_checksum("shared-name"),
                 "loc1": "ag_s1/bundle",
                 "loc2": "ag_s2/bundle",
             },
@@ -255,10 +282,15 @@ def test_agents_session_id_downgrade_round_trip(tmp_path: Path) -> None:
     with engine.begin() as conn:
         conn.execute(
             sa.text(
-                "INSERT INTO agents (id, created_at, name, bundle_location, version, kind)"
-                " VALUES ('ag_tmpl', 1, 'my-template', 'ag_tmpl/b', 1, 'template'),"
-                "        ('ag_sess', 2, 'my-session', 'ag_sess/b', 1, 'session')"
-            )
+                "INSERT INTO agents"
+                " (id, created_at, name, name_cksum, bundle_location, version, kind)"
+                " VALUES ('ag_tmpl', 1, 'my-template', :tmpl_cksum, 'ag_tmpl/b', 1, 'template'),"
+                "        ('ag_sess', 2, 'my-session', :sess_cksum, 'ag_sess/b', 1, 'session')"
+            ),
+            {
+                "tmpl_cksum": name_checksum("my-template"),
+                "sess_cksum": name_checksum("my-session"),
+            },
         )
         conn.execute(
             sa.text(

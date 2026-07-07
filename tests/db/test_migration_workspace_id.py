@@ -10,7 +10,7 @@ import sqlalchemy as sa
 from alembic import command
 from sqlalchemy.engine import Engine
 
-from omnigent.db.db_models import DEFAULT_WORKSPACE_ID
+from omnigent.db.db_models import DEFAULT_WORKSPACE_ID, name_checksum
 from omnigent.db.utils import (
     _build_alembic_config,
     clear_engine_cache,
@@ -69,9 +69,10 @@ def test_existing_rows_and_omitted_inserts_default_to_zero(db_engine: Engine) ->
         conn.execute(
             sa.text(
                 "INSERT INTO agents"
-                " (id, created_at, name, bundle_location, version, kind)"
-                " VALUES ('ag_ws', 1, 'n', 'loc', 1, 'template')"
-            )
+                " (id, created_at, name, name_cksum, bundle_location, version, kind)"
+                " VALUES ('ag_ws', 1, 'n', :cksum, 'loc', 1, 'template')"
+            ),
+            {"cksum": name_checksum("n")},
         )
         workspace_id = conn.execute(
             sa.text("SELECT workspace_id FROM agents WHERE id = 'ag_ws'")

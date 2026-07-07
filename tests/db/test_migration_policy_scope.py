@@ -10,6 +10,7 @@ import sqlalchemy as sa
 from alembic import command
 from sqlalchemy.engine import Engine
 
+from omnigent.db.db_models import name_checksum
 from omnigent.db.utils import (
     _build_alembic_config,
     clear_engine_cache,
@@ -37,10 +38,13 @@ def test_scope_column_exists_and_is_not_nullable(db_engine: Engine) -> None:
 
 
 def test_ix_policies_default_name_index_exists(db_engine: Engine) -> None:
-    """ix_policies_default_name unique index is present after the migration."""
+    """The default-name unique index is on name_cksum at head."""
     indexes = {i["name"]: i for i in sa.inspect(db_engine).get_indexes("policies")}
-    assert "ix_policies_default_name" in indexes
-    assert indexes["ix_policies_default_name"]["unique"]
+    # The name_cksum migration (r1a2b3c4d5e6) swaps this partial unique
+    # index off the raw name onto the checksum column.
+    assert "ix_policies_default_name" not in indexes
+    assert "ix_policies_default_name_cksum" in indexes
+    assert indexes["ix_policies_default_name_cksum"]["unique"]
 
 
 def test_backfill_sets_session_scope_for_session_policies(db_engine: Engine) -> None:
@@ -56,9 +60,11 @@ def test_backfill_sets_session_scope_for_session_policies(db_engine: Engine) -> 
         conn.execute(
             sa.text(
                 "INSERT INTO policies"
-                " (id, name, session_id, scope, created_at, type, handler, enabled)"
-                " VALUES ('pol_sc1', 'sess_pol', 'conv_sc1', 'session', 1, 'python', 'mod.f', 1)"
-            )
+                " (id, name, name_cksum, session_id, scope, created_at, type, handler, enabled)"
+                " VALUES ('pol_sc1', 'sess_pol', :cksum, 'conv_sc1', 'session', 1,"
+                " 'python', 'mod.f', 1)"
+            ),
+            {"cksum": name_checksum("sess_pol")},
         )
         scope = conn.execute(
             sa.text("SELECT scope FROM policies WHERE id = 'pol_sc1'")
@@ -72,9 +78,11 @@ def test_backfill_sets_default_scope_for_default_policies(db_engine: Engine) -> 
         conn.execute(
             sa.text(
                 "INSERT INTO policies"
-                " (id, name, session_id, scope, created_at, type, handler, enabled)"
-                " VALUES ('pol_def1', 'def_pol', NULL, 'default', 1, 'python', 'mod.f', 1)"
-            )
+                " (id, name, name_cksum, session_id, scope, created_at, type, handler, enabled)"
+                " VALUES ('pol_def1', 'def_pol', :cksum, NULL, 'default', 1,"
+                " 'python', 'mod.f', 1)"
+            ),
+            {"cksum": name_checksum("def_pol")},
         )
         scope = conn.execute(
             sa.text("SELECT scope FROM policies WHERE id = 'pol_def1'")
