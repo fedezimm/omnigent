@@ -8,11 +8,20 @@ subprocess and gateway load bounded.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
+from tests.harness_bench.events import (
+    HarnessFinished,
+    HarnessSkipped,
+    HarnessStarted,
+    ProbeFinished,
+    ProbeStarted,
+    ProgressSink,
+)
 from tests.harness_bench.probes import ALL_PROBES, CapabilityProbe
 from tests.harness_bench.profile import BenchProfile
 from tests.harness_bench.transport import resolve_driver_class
@@ -20,10 +29,9 @@ from tests.harness_bench.verdict import Applicability, Priority, ProbeResult, Ve
 
 _logger = logging.getLogger(__name__)
 
-# A progress sink: the bench calls it with human-readable status lines as it
-# spawns harnesses and runs probes. ``None`` (the default) stays silent, which
-# is what the pytest layer wants; the CLI passes a stderr writer so a live run
-# is not silent for minutes.
+# Back-compat: a plain per-line progress callback. The orchestrator now emits
+# structured events to a ProgressSink; callers that still pass a line callback
+# get it adapted to a LineSink. ``None`` stays silent (the pytest layer).
 Progress = Callable[[str], None]
 
 # The prerequisite probe: if it does not pass, the harness cannot be exercised
@@ -131,9 +139,24 @@ def _uniform_report(
     return HarnessReport(profile=profile, cells=cells, skipped_reason=skipped_reason)
 
 
-def _emit(progress: Progress | None, message: str) -> None:
-    if progress is not None:
-        progress(message)
+def _as_sink(progress: Progress | ProgressSink | None) -> ProgressSink | None:
+    """Normalize the ``progress`` argument to a :class:`ProgressSink`.
+
+    Accepts a structured sink (used as-is), a plain line callback (adapted to a
+    :class:`~tests.harness_bench.events.LineSink`), or ``None`` (silent).
+    """
+    if progress is None:
+        return None
+    if isinstance(progress, ProgressSink):
+        return progress
+    from tests.harness_bench.events import LineSink
+
+    return LineSink(progress)  # a bare callable → line output
+
+
+def _emit(sink: ProgressSink | None, event) -> None:
+    if sink is not None:
+        sink.emit(event)
 
 
 async def run_harness(
@@ -143,7 +166,7 @@ async def run_harness(
     databricks_profile: str | None = None,
     live: bool = True,
     transport: str | None = None,
-    progress: Progress | None = None,
+    progress: Progress | ProgressSink | None = None,
 ) -> HarnessReport:
     """Run every applicable probe against one harness.
 
@@ -156,11 +179,12 @@ async def run_harness(
         anything — used for a fast ``--list``/dry render.
     :param transport: ``--transport`` override; wins over the profile's
         declared transport when set (see :func:`resolve_driver_class`).
-    :param progress: Optional status sink called with human-readable lines
-        as the harness spawns and each probe runs. ``None`` stays silent.
+    :param progress: A :class:`ProgressSink` (structured events), a plain
+        per-line callback (adapted), or ``None`` (silent).
     :returns: The :class:`HarnessReport`.
     """
     probes = probes if probes is not None else ALL_PROBES
+    sink = _as_sink(progress)
 
     if not live:
         return _uniform_report(profile, probes, ProbeResult.skipped("offline (declared shown)"))
@@ -168,17 +192,13 @@ async def run_harness(
     driver_cls = resolve_driver_class(profile, override=transport)
     unavailable = driver_cls.unavailable(profile, databricks_profile=databricks_profile)
     if unavailable is not None:
-        _emit(progress, f"[{profile.harness}] skipped: {unavailable}")
+        _emit(sink, HarnessSkipped(profile.harness, unavailable))
         return _uniform_report(
             profile, probes, ProbeResult.skipped(unavailable), skipped_reason=unavailable
         )
 
     assert databricks_profile is not None  # guaranteed by the unavailable() check
-    _emit(
-        progress,
-        f"[{profile.harness}] provisioning {driver_cls.transport} transport "
-        f"(model={profile.model}); first turn may take ~10-30s...",
-    )
+    _emit(sink, HarnessStarted(profile.harness, driver_cls.transport, profile.model))
     cells: list[CellResult] = []
     driver_cm = driver_cls(profile, databricks_profile=databricks_profile)
     try:
@@ -199,7 +219,7 @@ async def run_harness(
         with contextlib.suppress(Exception):
             await driver_cm.__aexit__(type(exc), exc, exc.__traceback__)
         reason = f"provisioning failed: {exc}"
-        _emit(progress, f"[{profile.harness}] skipped: {reason}")
+        _emit(sink, HarnessSkipped(profile.harness, reason))
         return _uniform_report(profile, probes, ProbeResult.skipped(reason), skipped_reason=reason)
     try:
         driver = entered
@@ -210,18 +230,18 @@ async def run_harness(
                 continue
             if prereq_skip is not None:
                 observed = ProbeResult.skipped(prereq_skip)
-                _emit(progress, f"[{profile.harness}]   {probe.title}: skipped (prerequisite)")
             else:
-                _emit(progress, f"[{profile.harness}]   {probe.title}: running...")
+                _emit(sink, ProbeStarted(profile.harness, probe.name, probe.title))
                 try:
                     observed = await probe.run(driver, profile)
                 except Exception as exc:
                     observed = ProbeResult(Verdict.UNKNOWN, note=f"probe raised: {exc!r}")
-                _emit(
-                    progress,
-                    f"[{profile.harness}]   {probe.title}: {observed.verdict.name}"
-                    + (f" ({observed.note})" if observed.note else ""),
-                )
+            _emit(
+                sink,
+                ProbeFinished(
+                    profile.harness, probe.name, probe.title, observed.verdict, observed.note
+                ),
+            )
             cell = _cell(probe, profile, observed)
             cells.append(cell)
             # If the prerequisite turn did not pass, short-circuit the rest:
@@ -230,6 +250,7 @@ async def run_harness(
                 prereq_skip = f"prerequisite '{probe.title}' did not pass ({observed.note})"
     finally:
         await driver_cm.__aexit__(None, None, None)
+    _emit(sink, HarnessFinished(profile.harness))
     return HarnessReport(profile=profile, cells=cells)
 
 
@@ -240,18 +261,49 @@ async def run_bench(
     databricks_profile: str | None = None,
     live: bool = True,
     transport: str | None = None,
-    progress: Progress | None = None,
+    progress: Progress | ProgressSink | None = None,
+    jobs: int = 1,
 ) -> BenchMatrix:
-    """Run the bench across *profiles*, sequentially, into a :class:`BenchMatrix`."""
-    reports = [
-        await run_harness(
-            p,
-            probes=probes,
-            databricks_profile=databricks_profile,
-            live=live,
-            transport=transport,
-            progress=progress,
-        )
-        for p in profiles
-    ]
-    return BenchMatrix(reports=reports)
+    """Run the bench across *profiles* into a :class:`BenchMatrix`.
+
+    :param jobs: Max harnesses to run concurrently. ``1`` (default) is the
+        original sequential behavior. ``>1`` runs up to *jobs* harnesses at
+        once, bounded by a semaphore. Probes *within* a harness always run
+        sequentially — they share one driver/session with a single in-flight
+        turn — so concurrency is only across harnesses. Each harness owns its
+        own server/runner (or wrap subprocess + host daemon), so they do not
+        share transport state; the cap keeps process/port and gateway load
+        bounded rather than spawning every harness at once. Report order
+        always matches *profiles* order regardless of finish order.
+    """
+    if jobs <= 1:
+        reports = [
+            await run_harness(
+                p,
+                probes=probes,
+                databricks_profile=databricks_profile,
+                live=live,
+                transport=transport,
+                progress=progress,
+            )
+            for p in profiles
+        ]
+        return BenchMatrix(reports=reports)
+
+    semaphore = asyncio.Semaphore(jobs)
+
+    async def _one(p: BenchProfile) -> HarnessReport:
+        async with semaphore:
+            return await run_harness(
+                p,
+                probes=probes,
+                databricks_profile=databricks_profile,
+                live=live,
+                transport=transport,
+                progress=progress,
+            )
+
+    # gather preserves input order in its result list, so the matrix stays in
+    # *profiles* order even though harnesses finish out of order.
+    reports = await asyncio.gather(*(_one(p) for p in profiles))
+    return BenchMatrix(reports=list(reports))

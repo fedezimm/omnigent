@@ -153,6 +153,160 @@ async def test_offline_render_produces_matrix() -> None:
     assert {h["harness"] for h in payload["harnesses"]} == {p.harness for p in _OFFICIAL}
 
 
+# ── Progress events / rich / parallel / report (offline) ─────────
+
+
+async def test_run_harness_emits_structured_events_and_linesink_adapts() -> None:
+    """run_harness emits typed events; a bare-callable progress adapts to LineSink.
+
+    Uses a fake driver so no creds/subprocess are needed: a basic turn passes,
+    which lets every probe run and produce a ProbeFinished.
+    """
+    import tests.harness_bench.bench as bench_mod
+    from tests.harness_bench.driver import TurnResult
+    from tests.harness_bench.events import (
+        HarnessFinished,
+        HarnessStarted,
+        ProbeFinished,
+        ProbeStarted,
+        ProgressSink,
+    )
+
+    class _CaptureSink:
+        def __init__(self) -> None:
+            self.events: list = []
+
+        def emit(self, event) -> None:
+            self.events.append(event)
+
+        def close(self) -> None:
+            pass
+
+    assert isinstance(_CaptureSink(), ProgressSink)  # structural conformance
+
+    class _OKDriver:
+        transport = "sdk-inproc"
+
+        def __init__(self, profile: BenchProfile, *, databricks_profile: str) -> None:
+            pass
+
+        @staticmethod
+        def unavailable(profile: BenchProfile, *, databricks_profile: str | None) -> str | None:
+            return None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc: object) -> None:
+            pass
+
+        async def run_basic_turn(self, marker: str) -> TurnResult:
+            return TurnResult(completed=True, text=marker)
+
+        async def run_streaming_turn(self) -> TurnResult:
+            return TurnResult(completed=True, text_delta_count=5)
+
+        async def run_tool_turn(self, *, deny: bool) -> TurnResult:
+            return TurnResult(completed=True)
+
+        async def run_interrupt_turn(self) -> TurnResult:
+            return TurnResult(cancelled=True)
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(bench_mod, "resolve_driver_class", lambda p, *, override: _OKDriver)
+    try:
+        profile = BenchProfile(
+            harness="fake-sdk", model="m", env_prefix="HARNESS_FAKE_SDK_", marker="FAKE_OK"
+        )
+        sink = _CaptureSink()
+        await run_harness(profile, databricks_profile="oss", live=True, progress=sink)
+    finally:
+        monkeypatch.undo()
+
+    kinds = [type(e).__name__ for e in sink.events]
+    assert kinds[0] == "HarnessStarted"
+    assert isinstance(sink.events[0], HarnessStarted)
+    assert kinds[-1] == "HarnessFinished"
+    assert isinstance(sink.events[-1], HarnessFinished)
+    # Every probe that ran emits a started+finished pair.
+    assert any(isinstance(e, ProbeStarted) for e in sink.events)
+    finished = [e for e in sink.events if isinstance(e, ProbeFinished)]
+    assert {e.probe for e in finished} >= {"basic_turn", "streaming"}
+
+    # A bare callable is adapted to a LineSink (structured events → lines).
+    lines: list[str] = []
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(bench_mod, "resolve_driver_class", lambda p, *, override: _OKDriver)
+    try:
+        await run_harness(profile, databricks_profile="oss", live=True, progress=lines.append)
+    finally:
+        monkeypatch.undo()
+    assert any("Basic turn" in ln for ln in lines)
+
+
+async def test_run_bench_jobs_preserves_order(monkeypatch: pytest.MonkeyPatch) -> None:
+    """--jobs > 1 runs harnesses concurrently but keeps report order == input order."""
+    import asyncio as _asyncio
+
+    import tests.harness_bench.bench as bench_mod
+    from tests.harness_bench.driver import TurnResult
+
+    class _SlowDriver:
+        transport = "sdk-inproc"
+
+        def __init__(self, profile: BenchProfile, *, databricks_profile: str) -> None:
+            self._h = profile.harness
+
+        @staticmethod
+        def unavailable(profile: BenchProfile, *, databricks_profile: str | None) -> str | None:
+            return None
+
+        async def __aenter__(self):
+            # Reverse-stagger the delay so, without order preservation, finish
+            # order would differ from input order.
+            await _asyncio.sleep(0.02 if self._h.endswith("1") else 0.01)
+            return self
+
+        async def __aexit__(self, *exc: object) -> None:
+            pass
+
+        async def run_basic_turn(self, marker: str) -> TurnResult:
+            return TurnResult(completed=True, text=marker)
+
+        async def run_streaming_turn(self) -> TurnResult:
+            return TurnResult(completed=True, text_delta_count=3)
+
+        async def run_tool_turn(self, *, deny: bool) -> TurnResult:
+            return TurnResult(completed=True)
+
+        async def run_interrupt_turn(self) -> TurnResult:
+            return TurnResult(cancelled=True)
+
+    monkeypatch.setattr(bench_mod, "resolve_driver_class", lambda p, *, override: _SlowDriver)
+    profiles = [
+        BenchProfile(harness=f"fake-{i}", model="m", env_prefix=f"HARNESS_F{i}_", marker="X")
+        for i in range(3)
+    ]
+    matrix = await run_bench(profiles, databricks_profile="oss", live=True, jobs=3)
+    assert [r.profile.harness for r in matrix.reports] == ["fake-0", "fake-1", "fake-2"]
+
+
+def test_cli_writes_report_file(tmp_path) -> None:
+    """`--report PATH` writes the matrix; format follows the extension."""
+    from tests.harness_bench.__main__ import main
+
+    md = tmp_path / "matrix.md"
+    rc = main(["--no-live", "--report", str(md)])
+    assert rc == 0
+    text = md.read_text()
+    assert "Harness capability matrix" in text and "| Harness |" in text
+
+    js = tmp_path / "matrix.json"
+    main(["--no-live", "--report", str(js)])
+    payload = json.loads(js.read_text())
+    assert payload.get("harnesses")
+
+
 # ── Live layer (gated) ──────────────────────────────────────────
 
 

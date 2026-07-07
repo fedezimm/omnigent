@@ -82,6 +82,37 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--no-color", action="store_true", help="Disable ANSI color in the terminal table."
     )
+    parser.add_argument(
+        "--jobs",
+        "-j",
+        type=int,
+        default=1,
+        metavar="N",
+        help="Run up to N harnesses concurrently (default 1 = sequential). "
+        "Probes within a harness stay sequential. Higher N cuts wall-clock but "
+        "raises process / gateway load; 3-4 is a reasonable ceiling on one host.",
+    )
+    rich_grp = parser.add_mutually_exclusive_group()
+    rich_grp.add_argument(
+        "--rich",
+        dest="rich",
+        action="store_true",
+        default=None,
+        help="Force the live rich progress table (needs a TTY + rich).",
+    )
+    rich_grp.add_argument(
+        "--no-rich",
+        dest="rich",
+        action="store_false",
+        help="Force plain per-line progress (no live table).",
+    )
+    parser.add_argument(
+        "--report",
+        metavar="PATH",
+        default=None,
+        help="Also write the final matrix to PATH. Format follows --json / "
+        "--markdown, else inferred from the extension (.json / .md), else plain text.",
+    )
     parser.add_argument("--list", action="store_true", help="List official harnesses and exit.")
     return parser.parse_args(argv)
 
@@ -115,17 +146,22 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
+    if args.jobs < 1:
+        print("--jobs must be >= 1", file=sys.stderr)
+        return 2
+
     # Live if explicitly forced, or implied by a supplied profile.
     live = args.live if args.live is not None else bool(args.profile)
     if live and not args.profile:
         print("--live requires --profile <name>", file=sys.stderr)
         return 2
 
-    # Live runs make network calls that can take tens of seconds per turn.
-    # Stream progress to stderr (report goes to stdout) so the run is not
-    # silent; offline is fast enough to stay quiet.
-    def _progress(line: str) -> None:
-        print(line, file=sys.stderr, flush=True)
+    # Progress sink: only for a live run (offline is instant). Prefer the rich
+    # live table when a TTY + rich are available (or --rich forces it), else
+    # fall back to plain per-line output on stderr (the report goes to stdout).
+    sink = None
+    if live:
+        sink = _select_progress_sink(args.rich)
 
     matrix = asyncio.run(
         run_bench(
@@ -133,9 +169,13 @@ def main(argv: list[str] | None = None) -> int:
             databricks_profile=args.profile,
             live=live,
             transport=args.transport,
-            progress=_progress if live else None,
+            progress=sink,
+            jobs=args.jobs,
         )
     )
+    if sink is not None:
+        sink.close()
+
     # Offline (not live) has nothing observed, so show the declared matrix.
     declared = not live
     if args.json:
@@ -148,8 +188,53 @@ def main(argv: list[str] | None = None) -> int:
         color = sys.stdout.isatty() and not args.no_color
         output = render_table(matrix, color=color, declared=declared)
     print(output, end="")
+
+    if args.report:
+        _write_report(args.report, matrix, json_flag=args.json, markdown_flag=args.markdown)
+
     # A drift is a non-zero exit so CI / scripts notice without parsing output.
     return 1 if matrix.has_drift else 0
+
+
+def _select_progress_sink(rich_flag: bool | None):
+    """Pick the progress sink for a live run.
+
+    ``rich_flag``: ``True`` forces rich, ``False`` forces plain, ``None`` =
+    auto (rich on a TTY, plain otherwise). Falls back to the plain
+    :class:`LineSink` whenever rich is unavailable or not a terminal.
+    """
+    from tests.harness_bench.events import LineSink
+
+    def _line(msg: str) -> None:
+        print(msg, file=sys.stderr, flush=True)
+
+    if rich_flag is not False:
+        from tests.harness_bench.richreport import rich_sink_or_none
+
+        rich_sink = rich_sink_or_none(force=bool(rich_flag))
+        if rich_sink is not None:
+            return rich_sink
+        if rich_flag is True:
+            print("--rich requested but rich/TTY unavailable; using plain output", file=sys.stderr)
+    return LineSink(_line)
+
+
+def _write_report(path: str, matrix, *, json_flag: bool, markdown_flag: bool) -> None:
+    """Write the matrix to *path*; format from flags, else the extension."""
+    if json_flag:
+        content = render_json(matrix)
+    elif markdown_flag:
+        content = render_markdown(matrix, declared=False)
+    elif path.endswith(".json"):
+        content = render_json(matrix)
+    elif path.endswith((".md", ".markdown")):
+        content = render_markdown(matrix, declared=False)
+    else:
+        # Plain, un-colored grid — a file should never carry ANSI codes.
+        content = render_table(matrix, color=False, declared=False)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(content if content.endswith("\n") else content + "\n")
+    print(f"report written to {path}", file=sys.stderr)
 
 
 if __name__ == "__main__":
