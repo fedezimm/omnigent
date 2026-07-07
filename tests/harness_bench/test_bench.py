@@ -170,7 +170,6 @@ async def test_run_harness_emits_structured_events_and_linesink_adapts() -> None
     Uses a fake driver so no creds/subprocess are needed: a basic turn passes,
     which lets every probe run and produce a ProbeFinished.
     """
-    import tests.harness_bench.bench as bench_mod
     from tests.harness_bench.driver import TurnResult
     from tests.harness_bench.events import (
         HarnessFinished,
@@ -222,7 +221,8 @@ async def test_run_harness_emits_structured_events_and_linesink_adapts() -> None
 
     monkeypatch = pytest.MonkeyPatch()
     monkeypatch.setattr(
-        bench_mod, "resolve_driver_class", lambda p, *, override=None, fast=False: _OKDriver
+        "tests.harness_bench.bench.resolve_driver_class",
+        lambda p, *, override=None, fast=False: _OKDriver,
     )
     try:
         profile = BenchProfile(
@@ -247,7 +247,8 @@ async def test_run_harness_emits_structured_events_and_linesink_adapts() -> None
     lines: list[str] = []
     monkeypatch = pytest.MonkeyPatch()
     monkeypatch.setattr(
-        bench_mod, "resolve_driver_class", lambda p, *, override=None, fast=False: _OKDriver
+        "tests.harness_bench.bench.resolve_driver_class",
+        lambda p, *, override=None, fast=False: _OKDriver,
     )
     try:
         await run_harness(profile, databricks_profile="oss", live=True, progress=lines.append)
@@ -260,7 +261,6 @@ async def test_run_bench_jobs_preserves_order(monkeypatch: pytest.MonkeyPatch) -
     """--jobs > 1 runs harnesses concurrently but keeps report order == input order."""
     import asyncio as _asyncio
 
-    import tests.harness_bench.bench as bench_mod
     from tests.harness_bench.driver import TurnResult
 
     class _SlowDriver:
@@ -295,7 +295,8 @@ async def test_run_bench_jobs_preserves_order(monkeypatch: pytest.MonkeyPatch) -
             return TurnResult(cancelled=True)
 
     monkeypatch.setattr(
-        bench_mod, "resolve_driver_class", lambda p, *, override=None, fast=False: _SlowDriver
+        "tests.harness_bench.bench.resolve_driver_class",
+        lambda p, *, override=None, fast=False: _SlowDriver,
     )
     profiles = [
         BenchProfile(harness=f"fake-{i}", model="m", env_prefix=f"HARNESS_F{i}_", marker="X")
@@ -312,7 +313,6 @@ async def test_parallel_full_server_shares_one_server(monkeypatch: pytest.Monkey
     one SharedFullServer is entered once and each harness registers its own
     agent+session on it.
     """
-    import tests.harness_bench.bench as bench_mod
     from tests.harness_bench.driver import TurnResult
 
     built: list[object] = []
@@ -369,9 +369,10 @@ async def test_parallel_full_server_shares_one_server(monkeypatch: pytest.Monkey
             return TurnResult(cancelled=True)
 
     # bench imports SharedFullServer into its own namespace, so patch it there.
-    monkeypatch.setattr(bench_mod, "SharedFullServer", _FakeShared)
+    monkeypatch.setattr("tests.harness_bench.bench.SharedFullServer", _FakeShared)
     monkeypatch.setattr(
-        bench_mod, "resolve_driver_class", lambda p, *, override=None, fast=False: _FSDriver
+        "tests.harness_bench.bench.resolve_driver_class",
+        lambda p, *, override=None, fast=False: _FSDriver,
     )
 
     profiles = [
