@@ -8,7 +8,12 @@ from typing import Any
 from sqlalchemy import asc, select
 from sqlalchemy.exc import IntegrityError
 
-from omnigent.db.db_models import POLICY_SCOPE_DEFAULT, POLICY_SCOPE_SESSION, SqlPolicy
+from omnigent.db.db_models import (
+    DEFAULT_WORKSPACE_ID,
+    POLICY_SCOPE_DEFAULT,
+    POLICY_SCOPE_SESSION,
+    SqlPolicy,
+)
 from omnigent.db.utils import (
     get_or_create_engine,
     make_managed_session_maker,
@@ -99,7 +104,7 @@ class SqlAlchemyPolicyStore(PolicyStore):
     def get(self, policy_id: str, session_id: str) -> Policy | None:
         """Return the policy if it belongs to the given session."""
         with self._session() as session:
-            row = session.get(SqlPolicy, policy_id)
+            row = session.get(SqlPolicy, (DEFAULT_WORKSPACE_ID, policy_id))
             if row is None or row.session_id != session_id:
                 return None
             return _to_entity(row)
@@ -129,7 +134,7 @@ class SqlAlchemyPolicyStore(PolicyStore):
         wrong session.
         """
         with self._session() as session:
-            row = session.get(SqlPolicy, policy_id)
+            row = session.get(SqlPolicy, (DEFAULT_WORKSPACE_ID, policy_id))
             if row is None or row.session_id != session_id:
                 return None
             changed = False
@@ -150,7 +155,7 @@ class SqlAlchemyPolicyStore(PolicyStore):
     def delete(self, policy_id: str, session_id: str) -> bool:
         """Delete a policy. Idempotent: returns ``False`` if not found."""
         with self._session() as session:
-            row = session.get(SqlPolicy, policy_id)
+            row = session.get(SqlPolicy, (DEFAULT_WORKSPACE_ID, policy_id))
             if row is None or row.session_id != session_id:
                 return False
             session.delete(row)
@@ -217,7 +222,7 @@ class SqlAlchemyPolicyStore(PolicyStore):
     def get_default(self, policy_id: str) -> Policy | None:
         """Return a default policy by ID (``scope = 'default'``)."""
         with self._session() as session:
-            row = session.get(SqlPolicy, policy_id)
+            row = session.get(SqlPolicy, (DEFAULT_WORKSPACE_ID, policy_id))
             if row is None or row.scope != POLICY_SCOPE_DEFAULT:
                 return None
             return _to_entity(row)
@@ -246,7 +251,7 @@ class SqlAlchemyPolicyStore(PolicyStore):
         if not found or not a default policy.
         """
         with self._session() as session:
-            row = session.get(SqlPolicy, policy_id)
+            row = session.get(SqlPolicy, (DEFAULT_WORKSPACE_ID, policy_id))
             if row is None or row.scope != POLICY_SCOPE_DEFAULT:
                 return None
             changed = False
@@ -286,7 +291,7 @@ class SqlAlchemyPolicyStore(PolicyStore):
     def delete_default(self, policy_id: str) -> bool:
         """Delete a default policy. Idempotent."""
         with self._session() as session:
-            row = session.get(SqlPolicy, policy_id)
+            row = session.get(SqlPolicy, (DEFAULT_WORKSPACE_ID, policy_id))
             if row is None or row.scope != POLICY_SCOPE_DEFAULT:
                 return False
             session.delete(row)

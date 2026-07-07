@@ -26,6 +26,7 @@ from omnigent._wrapper_labels import UI_MODE_LABEL_KEY, WRAPPER_LABEL_KEY
 from omnigent.db.converters import sql_agent_to_entity
 from omnigent.db.db_models import (
     AGENT_KIND_SESSION,
+    DEFAULT_WORKSPACE_ID,
     LABEL_VALUE_MAX_LEN,
     SqlAgent,
     SqlComment,
@@ -292,7 +293,7 @@ def _upsert_labels(
     for row in rows:
         existing = session.get(
             SqlConversationLabel,
-            (row["conversation_id"], row["key"]),
+            (DEFAULT_WORKSPACE_ID, row["conversation_id"], row["key"]),
         )
         if existing is None:
             session.add(SqlConversationLabel(**row))
@@ -339,7 +340,7 @@ def _dialect_upsert_labels(
 
         stmt = pg_insert(SqlConversationLabel).values(rows)
     stmt = stmt.on_conflict_do_update(
-        index_elements=["conversation_id", "key"],
+        index_elements=["workspace_id", "conversation_id", "key"],
         set_={
             "value": stmt.excluded.value,
             "updated_at": stmt.excluded.updated_at,
@@ -635,7 +636,9 @@ class SqlAlchemyConversationStore(ConversationStore):
                     # it lands.
                     root_id: str = new_id
                 else:
-                    parent_row = session.get(SqlConversation, parent_conversation_id)
+                    parent_row = session.get(
+                        SqlConversation, (DEFAULT_WORKSPACE_ID, parent_conversation_id)
+                    )
                     if parent_row is None:
                         raise ConversationNotFoundError(
                             f"parent conversation {parent_conversation_id!r} does not exist"
@@ -712,7 +715,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             ``None``.
         """
         with self._session() as session:
-            row = session.get(SqlConversation, conversation_id)
+            row = session.get(SqlConversation, (DEFAULT_WORKSPACE_ID, conversation_id))
             if row is None:
                 return None
             return _to_conversation(row, _fetch_labels(session, conversation_id))
@@ -1015,7 +1018,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             # Generic dialect fallback — SELECT-then-INSERT/UPDATE in one
             # transaction (race-safe under SERIALIZABLE / SQLite's
             # single-writer semantics).
-            existing = session.get(SqlUserDailyCost, (user_id, day_utc))
+            existing = session.get(SqlUserDailyCost, (DEFAULT_WORKSPACE_ID, user_id, day_utc))
             if existing is None:
                 session.add(
                     SqlUserDailyCost(
@@ -1074,7 +1077,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             stmt = pg_insert(SqlUserDailyCost)
         stmt = stmt.values(user_id=user_id, day_utc=day_utc, cost_usd=delta_usd, updated_at=now)
         stmt = stmt.on_conflict_do_update(
-            index_elements=["user_id", "day_utc"],
+            index_elements=["workspace_id", "user_id", "day_utc"],
             set_={
                 "cost_usd": SqlUserDailyCost.cost_usd + stmt.excluded.cost_usd,
                 "updated_at": stmt.excluded.updated_at,
@@ -1093,7 +1096,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             exists for ``(user_id, day_utc)``.
         """
         with self._session() as session:
-            row = session.get(SqlUserDailyCost, (user_id, day_utc))
+            row = session.get(SqlUserDailyCost, (DEFAULT_WORKSPACE_ID, user_id, day_utc))
             return float(row.cost_usd) if row is not None else 0.0
 
     def get_daily_cost_state(self, user_id: str, day_utc: str) -> dict[str, float]:
@@ -1111,7 +1114,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             both ``0.0`` when no row exists for ``(user_id, day_utc)``.
         """
         with self._session() as session:
-            row = session.get(SqlUserDailyCost, (user_id, day_utc))
+            row = session.get(SqlUserDailyCost, (DEFAULT_WORKSPACE_ID, user_id, day_utc))
             if row is None:
                 return {"cost_usd": 0.0, "ask_approved_usd": 0.0}
             return {
@@ -1162,7 +1165,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 # On conflict touch only the approval (+ stamp) — never
                 # the accumulated cost.
                 stmt = stmt.on_conflict_do_update(
-                    index_elements=["user_id", "day_utc"],
+                    index_elements=["workspace_id", "user_id", "day_utc"],
                     set_={
                         "ask_approved_usd": stmt.excluded.ask_approved_usd,
                         "updated_at": stmt.excluded.updated_at,
@@ -1171,7 +1174,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 session.execute(stmt)
                 return
             # Generic dialect fallback — SELECT-then-INSERT/UPDATE.
-            existing = session.get(SqlUserDailyCost, (user_id, day_utc))
+            existing = session.get(SqlUserDailyCost, (DEFAULT_WORKSPACE_ID, user_id, day_utc))
             if existing is None:
                 session.add(
                     SqlUserDailyCost(
@@ -1438,7 +1441,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             self._lock_conversation(session, conversation_id)
 
             # Bump updated_at on the conversation.
-            conv_row = session.get(SqlConversation, conversation_id)
+            conv_row = session.get(SqlConversation, (DEFAULT_WORKSPACE_ID, conversation_id))
             if conv_row is not None:
                 conv_row.updated_at = now
 
@@ -1874,7 +1877,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             if the conversation does not exist.
         """
         with self._session() as session:
-            row = session.get(SqlConversation, conversation_id)
+            row = session.get(SqlConversation, (DEFAULT_WORKSPACE_ID, conversation_id))
             if not row:
                 return None
             changed = False
@@ -1962,7 +1965,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             exists for ``conversation_id``.
         """
         with self._session() as session:
-            row = session.get(SqlConversation, conversation_id)
+            row = session.get(SqlConversation, (DEFAULT_WORKSPACE_ID, conversation_id))
             if row is None:
                 raise ConversationNotFoundError(
                     f"conversation {conversation_id!r} does not exist",
@@ -1982,7 +1985,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             exists for ``conversation_id``.
         """
         with self._session() as session:
-            row = session.get(SqlConversation, conversation_id)
+            row = session.get(SqlConversation, (DEFAULT_WORKSPACE_ID, conversation_id))
             if row is None:
                 raise ConversationNotFoundError(
                     f"conversation {conversation_id!r} does not exist",
@@ -2007,7 +2010,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             exists for ``conversation_id``.
         """
         with self._session() as session:
-            row = session.get(SqlConversation, conversation_id)
+            row = session.get(SqlConversation, (DEFAULT_WORKSPACE_ID, conversation_id))
             if row is None:
                 raise ConversationNotFoundError(
                     f"conversation {conversation_id!r} does not exist",
@@ -2092,7 +2095,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             and the caller did not supply one).
         """
         with self._session() as session:
-            row = session.get(SqlConversation, conversation_id)
+            row = session.get(SqlConversation, (DEFAULT_WORKSPACE_ID, conversation_id))
             if row is None:
                 raise ConversationNotFoundError(
                     f"conversation {conversation_id!r} does not exist",
@@ -2129,7 +2132,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             ``external_session_id``.
         """
         with self._session() as session:
-            row = session.get(SqlConversation, conversation_id)
+            row = session.get(SqlConversation, (DEFAULT_WORKSPACE_ID, conversation_id))
             if row is None:
                 raise ConversationNotFoundError(
                     f"conversation {conversation_id!r} does not exist",
@@ -2220,7 +2223,9 @@ class SqlAlchemyConversationStore(ConversationStore):
         with self._session() as session:
             root_conversation_id: str | None = None
             if parent_conversation_id is not None:
-                parent_row = session.get(SqlConversation, parent_conversation_id)
+                parent_row = session.get(
+                    SqlConversation, (DEFAULT_WORKSPACE_ID, parent_conversation_id)
+                )
                 if parent_row is None:
                     raise ConversationNotFoundError(
                         f"parent conversation {parent_conversation_id!r} does not exist"
@@ -2370,7 +2375,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         """
         now = now_epoch()
         with self._session() as session:
-            source = session.get(SqlConversation, source_conversation_id)
+            source = session.get(SqlConversation, (DEFAULT_WORKSPACE_ID, source_conversation_id))
             if source is None:
                 raise LookupError(f"conversation not found: {source_conversation_id!r}")
 
@@ -2608,7 +2613,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         """
         now = now_epoch()
         with self._session() as session:
-            row = session.get(SqlConversation, conversation_id)
+            row = session.get(SqlConversation, (DEFAULT_WORKSPACE_ID, conversation_id))
             if row is None:
                 raise LookupError(f"conversation not found: {conversation_id!r}")
 
@@ -2621,7 +2626,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             row.agent_id = None
             session.flush()
             if old_agent_id is not None:
-                old_agent = session.get(SqlAgent, old_agent_id)
+                old_agent = session.get(SqlAgent, (DEFAULT_WORKSPACE_ID, old_agent_id))
                 if old_agent is not None and old_agent.kind == AGENT_KIND_SESSION:
                     session.delete(old_agent)
                     session.flush()
@@ -2705,7 +2710,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             ``False`` otherwise.
         """
         with self._session() as session:
-            row = session.get(SqlConversation, conversation_id)
+            row = session.get(SqlConversation, (DEFAULT_WORKSPACE_ID, conversation_id))
             if not row:
                 return False
 

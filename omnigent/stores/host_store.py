@@ -20,7 +20,7 @@ from sqlalchemy import Engine, select, update
 from sqlalchemy import delete as sql_delete
 from sqlalchemy.orm import Session
 
-from omnigent.db.db_models import SqlConversation, SqlHost
+from omnigent.db.db_models import DEFAULT_WORKSPACE_ID, SqlConversation, SqlHost
 from omnigent.db.utils import get_or_create_engine, make_managed_session_maker, now_epoch
 
 # A host is considered live only if its row was touched (connect or
@@ -234,7 +234,7 @@ class HostStore:
             json.dumps(configured_harnesses) if configured_harnesses is not None else None
         )
         with self._session() as session:
-            row = session.get(SqlHost, (owner, name))
+            row = session.get(SqlHost, (DEFAULT_WORKSPACE_ID, owner, name))
             if row is None and allow_host_id_reown:
                 reowned = self._reown_host_id(
                     session,

@@ -33,7 +33,12 @@ import time
 from sqlalchemy import and_, delete, exists, select, update
 from sqlalchemy.exc import IntegrityError
 
-from omnigent.db.db_models import SqlAccountToken, SqlSessionPermission, SqlUser
+from omnigent.db.db_models import (
+    DEFAULT_WORKSPACE_ID,
+    SqlAccountToken,
+    SqlSessionPermission,
+    SqlUser,
+)
 from omnigent.db.utils import get_or_create_engine, make_managed_session_maker
 from omnigent.entities import Account, AccountToken
 from omnigent.server.auth import RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
@@ -115,7 +120,7 @@ class SqlAlchemyAccountStore:
         """
         now = int(time.time())
         with self._session() as session:
-            existing = session.get(SqlUser, user_id)
+            existing = session.get(SqlUser, (DEFAULT_WORKSPACE_ID, user_id))
             if existing is not None:
                 raise ValueError(f"user {user_id!r} already exists")
             row = SqlUser(
@@ -138,7 +143,7 @@ class SqlAlchemyAccountStore:
     def get_user(self, user_id: str) -> Account | None:
         """Look up a user by id. Returns ``None`` if missing."""
         with self._session() as session:
-            row = session.get(SqlUser, user_id)
+            row = session.get(SqlUser, (DEFAULT_WORKSPACE_ID, user_id))
             return _to_account(row) if row is not None else None
 
     def is_admin(self, user_id: str) -> bool:
@@ -151,7 +156,7 @@ class SqlAlchemyAccountStore:
         construction (single source of truth: the column).
         """
         with self._session() as session:
-            row = session.get(SqlUser, user_id)
+            row = session.get(SqlUser, (DEFAULT_WORKSPACE_ID, user_id))
             return row is not None and row.is_admin
 
     def set_admin(self, user_id: str, is_admin: bool) -> None:
@@ -218,7 +223,7 @@ class SqlAlchemyAccountStore:
         log, return, or store the value elsewhere.
         """
         with self._session() as session:
-            row = session.get(SqlUser, user_id)
+            row = session.get(SqlUser, (DEFAULT_WORKSPACE_ID, user_id))
             return row.password_hash if row is not None else None
 
     def update_password(self, user_id: str, password_hash: str) -> None:
@@ -322,7 +327,7 @@ class SqlAlchemyAccountStore:
             )
             if result.rowcount == 0:
                 return None
-            row = session.get(SqlAccountToken, token_id)
+            row = session.get(SqlAccountToken, (DEFAULT_WORKSPACE_ID, token_id))
             return _to_account_token(row) if row is not None else None
 
     def purge_expired_tokens(self, now_epoch_seconds: int) -> int:

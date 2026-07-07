@@ -8,6 +8,7 @@ from omnigent.db.converters import sql_agent_to_entity
 from omnigent.db.db_models import (
     AGENT_KIND_SESSION,
     AGENT_KIND_TEMPLATE,
+    DEFAULT_WORKSPACE_ID,
     SqlAgent,
     SqlConversation,
 )
@@ -83,7 +84,7 @@ class SqlAlchemyAgentStore(AgentStore):
         :returns: The :class:`Agent` if found, otherwise ``None``.
         """
         with self._session() as session:
-            row = session.get(SqlAgent, agent_id)
+            row = session.get(SqlAgent, (DEFAULT_WORKSPACE_ID, agent_id))
             if row is None:
                 return None
             # For session-scoped agents, derive the owning conversation id
@@ -212,7 +213,7 @@ class SqlAlchemyAgentStore(AgentStore):
             found.
         """
         with self._session() as session:
-            row = session.get(SqlAgent, agent_id)
+            row = session.get(SqlAgent, (DEFAULT_WORKSPACE_ID, agent_id))
             if not row:
                 return None
             row.bundle_location = bundle_location
@@ -235,7 +236,7 @@ class SqlAlchemyAgentStore(AgentStore):
             it did not exist.
         """
         with self._session() as session:
-            row = session.get(SqlAgent, agent_id)
+            row = session.get(SqlAgent, (DEFAULT_WORKSPACE_ID, agent_id))
             if not row:
                 return False
             session.delete(row)

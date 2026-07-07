@@ -40,6 +40,7 @@ from sqlalchemy import Engine, select, update
 from sqlalchemy.orm import Session
 
 from omnigent.db.db_models import (
+    DEFAULT_WORKSPACE_ID,
     SqlAccountToken,
     SqlComment,
     SqlHost,
@@ -147,12 +148,12 @@ def remap_identities(
             if old_id == new_id:
                 continue
 
-            old_user = session.get(SqlUser, old_id)
+            old_user = session.get(SqlUser, (DEFAULT_WORKSPACE_ID, old_id))
             if old_user is None:
                 report.skipped_missing.append(old_id)
                 continue
 
-            new_user = session.get(SqlUser, new_id)
+            new_user = session.get(SqlUser, (DEFAULT_WORKSPACE_ID, new_id))
             if new_user is not None:
                 if not force:
                     report.refused.append(f"{old_id} -> {new_id}")
@@ -183,7 +184,9 @@ def remap_identities(
                 .all()
             )
             for grant in old_grants:
-                existing = session.get(SqlSessionPermission, (new_id, grant.conversation_id))
+                existing = session.get(
+                    SqlSessionPermission, (DEFAULT_WORKSPACE_ID, new_id, grant.conversation_id)
+                )
                 if existing is not None:
                     if grant.level > existing.level:
                         existing.level = grant.level
@@ -220,7 +223,7 @@ def remap_identities(
                 session.execute(select(SqlHost).where(SqlHost.owner == old_id)).scalars().all()
             )
             for host in old_hosts:
-                clash = session.get(SqlHost, (new_id, host.name))
+                clash = session.get(SqlHost, (DEFAULT_WORKSPACE_ID, new_id, host.name))
                 if clash is not None:
                     session.delete(host)  # new owner already has this host name
                 else:
