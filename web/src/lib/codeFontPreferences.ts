@@ -72,14 +72,18 @@ export function readCodeFontSizePx(): number {
  * quota/access errors so a failed write can't break the app.
  */
 export function writeCodeFontSizePx(px: number): void {
+  const sizePx = clampCodeFontSizePx(px);
   if (typeof window !== "undefined") {
     try {
-      window.localStorage.setItem(SIZE_STORAGE_KEY, JSON.stringify(clampCodeFontSizePx(px)));
+      window.localStorage.setItem(SIZE_STORAGE_KEY, JSON.stringify(sizePx));
     } catch {
       // localStorage quota or access errors shouldn't break the app.
     }
   }
-  emit();
+  // Broadcast the intended value, not a storage re-read: if the write above
+  // failed (quota/denied), mounted editors/terminals must still re-font to the
+  // new size now rather than snapping back to the stale/default stored value.
+  emit({ sizePx, family: readCodeFontFamily() });
 }
 
 /**
@@ -125,11 +129,11 @@ export function readCodeFontFamily(): string {
  * blank. Swallows quota/access errors so a failed write can't break the app.
  */
 export function writeCodeFontFamily(name: string): void {
+  const family = normalizeCodeFontFamily(name);
   if (typeof window !== "undefined") {
     try {
-      const normalized = normalizeCodeFontFamily(name);
-      if (normalized) {
-        window.localStorage.setItem(FAMILY_STORAGE_KEY, JSON.stringify(normalized));
+      if (family) {
+        window.localStorage.setItem(FAMILY_STORAGE_KEY, JSON.stringify(family));
       } else {
         window.localStorage.removeItem(FAMILY_STORAGE_KEY);
       }
@@ -137,20 +141,22 @@ export function writeCodeFontFamily(name: string): void {
       // localStorage quota or access errors shouldn't break the app.
     }
   }
-  emit();
+  // Broadcast the intended value, not a storage re-read: a failed write must
+  // still live-apply the new family to mounted editors/terminals.
+  emit({ sizePx: readCodeFontSizePx(), family });
 }
 
 /**
  * Resolve a persisted family into the `fontFamily` value handed to a code
- * widget: a custom name gets the mono fallback stack appended (so an
- * uninstalled/partial name degrades to the app mono, not the widget's own
- * default or a serif), and an empty name returns `undefined` so the widget
- * keeps its own default. Terminals, whose native default isn't the app mono,
- * coalesce this with {@link CODE_FONT_FAMILY_FALLBACK}.
+ * widget. A custom name gets the mono fallback stack appended (so an
+ * uninstalled/partial name degrades to the app mono, not a serif); an empty
+ * name resolves to the fallback stack itself. Both Monaco and the terminal use
+ * this directly, so with no custom family they share one default look — the app
+ * mono stack — rather than each falling back to its own built-in default.
  */
-export function codeFontFamilyForEditor(family: string): string | undefined {
+export function codeFontFamilyForEditor(family: string): string {
   const normalized = normalizeCodeFontFamily(family);
-  return normalized ? `${normalized}, ${CODE_FONT_FAMILY_FALLBACK}` : undefined;
+  return normalized ? `${normalized}, ${CODE_FONT_FAMILY_FALLBACK}` : CODE_FONT_FAMILY_FALLBACK;
 }
 
 /** The current code font size + family, read together for widget construction. */
@@ -184,8 +190,7 @@ export function subscribeCodeFont(listener: CodeFontListener): () => void {
   };
 }
 
-/** Notify subscribers of the current persisted code font. Called after a write. */
-function emit(): void {
-  const font = readCodeFont();
+/** Notify subscribers of the given code font. Called after every write. */
+function emit(font: CodeFont): void {
   for (const listener of listeners) listener(font);
 }

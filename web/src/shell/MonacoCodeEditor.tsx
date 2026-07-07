@@ -400,7 +400,8 @@ function MonacoCodeEditorInner({
       scrollBeyondLastLine: false,
       // Code-font preference (Settings → Appearance), read at creation; live
       // changes arrive via updateOptions in the effect below. An unset family
-      // is undefined, so Monaco keeps its built-in mono default.
+      // resolves to the shared mono stack, so the editor matches the terminal
+      // rather than falling back to Monaco's own platform default.
       fontSize: readCodeFontSizePx(),
       fontFamily: codeFontFamilyForEditor(readCodeFontFamily()),
       automaticLayout: true,

@@ -14,11 +14,7 @@ import { WebLinksAddon } from "@xterm/addon-web-links";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { type ITheme, Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
-import {
-  CODE_FONT_FAMILY_FALLBACK,
-  codeFontFamilyForEditor,
-  readCodeFont,
-} from "@/lib/codeFontPreferences";
+import { codeFontFamilyForEditor, readCodeFont } from "@/lib/codeFontPreferences";
 
 // Card background colors derived from the app's CSS palette.
 // Light: --card: oklch(1.000 0 0) = pure white.
@@ -347,7 +343,7 @@ export class TerminalSession {
     // chrome, so an unset family falls back to the shared mono stack.
     const { sizePx, family } = readCodeFont();
     this.term = new Terminal({
-      fontFamily: codeFontFamilyForEditor(family) ?? CODE_FONT_FAMILY_FALLBACK,
+      fontFamily: codeFontFamilyForEditor(family),
       fontSize: sizePx,
       scrollback: 20000,
       cursorBlink: true,
@@ -514,7 +510,7 @@ export class TerminalSession {
    * any point after construction.
    */
   setFont(sizePx: number, family: string): void {
-    this.term.options.fontFamily = codeFontFamilyForEditor(family) ?? CODE_FONT_FAMILY_FALLBACK;
+    this.term.options.fontFamily = codeFontFamilyForEditor(family);
     this.term.options.fontSize = sizePx;
     this.sendResize();
   }

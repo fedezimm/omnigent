@@ -125,11 +125,11 @@ describe("codeFontFamilyForEditor", () => {
     expect(codeFontFamilyForEditor("Fira Code")).toBe(`Fira Code, ${CODE_FONT_FAMILY_FALLBACK}`);
   });
 
-  it("returns undefined for an empty family (widget keeps its own default)", () => {
-    // Monaco keeps its built-in mono when handed undefined; the terminal
-    // coalesces to CODE_FONT_FAMILY_FALLBACK at the call site.
-    expect(codeFontFamilyForEditor("")).toBeUndefined();
-    expect(codeFontFamilyForEditor("   ")).toBeUndefined();
+  it("resolves an empty family to the shared mono stack (uniform default)", () => {
+    // Both Monaco and the terminal get the same mono stack when no custom family
+    // is set, so their defaults match rather than each using its own built-in.
+    expect(codeFontFamilyForEditor("")).toBe(CODE_FONT_FAMILY_FALLBACK);
+    expect(codeFontFamilyForEditor("   ")).toBe(CODE_FONT_FAMILY_FALLBACK);
   });
 
   it("strips declaration-breaking chars before appending the fallback", () => {
@@ -180,6 +180,38 @@ describe("codeFontPreferences — pub/sub", () => {
     // widget and a later reload agree.
     expect(cb).toHaveBeenCalledWith({ sizePx: CODE_FONT_SIZE_MAX, family: "" });
 
+    unsubscribe();
+  });
+
+  it("emits the intended size even when the storage write throws", () => {
+    const cb = vi.fn();
+    const unsubscribe = subscribeCodeFont(cb);
+    // Storage disabled/quota-exceeded: the persist fails, but a mounted editor
+    // must still re-font to the chosen size now instead of the stale value.
+    const setItem = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw new Error("QuotaExceededError");
+    });
+    try {
+      writeCodeFontSizePx(19);
+      expect(cb).toHaveBeenCalledWith({ sizePx: 19, family: "" });
+    } finally {
+      setItem.mockRestore();
+    }
+    unsubscribe();
+  });
+
+  it("emits the intended family even when the storage write throws", () => {
+    const cb = vi.fn();
+    const unsubscribe = subscribeCodeFont(cb);
+    const setItem = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw new Error("QuotaExceededError");
+    });
+    try {
+      writeCodeFontFamily("Fira Code");
+      expect(cb).toHaveBeenCalledWith({ sizePx: CODE_FONT_SIZE_DEFAULT, family: "Fira Code" });
+    } finally {
+      setItem.mockRestore();
+    }
     unsubscribe();
   });
 });

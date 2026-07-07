@@ -171,7 +171,8 @@ export function MonacoDiffViewer({
       scrollBeyondLastLine: false,
       // Code-font preference (Settings → Appearance), read at creation; live
       // changes arrive via updateOptions in the effect above. An unset family
-      // is undefined, so Monaco keeps its built-in mono default.
+      // resolves to the shared mono stack, so the diff matches the terminal
+      // rather than falling back to Monaco's own platform default.
       fontSize: readCodeFontSizePx(),
       fontFamily: codeFontFamilyForEditor(readCodeFontFamily()),
       automaticLayout: true,
