@@ -44,7 +44,7 @@ from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissi
 # (scripts/check_benchmark_seed_schema.py) fails CI when the repo's head moves
 # past this without the seed being regenerated + this bumped. Keep in sync via
 # ``_get_head_db_revision(...)`` (see the guard script).
-SEED_SCHEMA_REVISION = "r1a2b3c4d5e6"
+SEED_SCHEMA_REVISION = "v1a2b3c4d5e6"
 
 # Label key stamped on the first seeded session recording the corpus config, so
 # a later run can detect an existing (and matching) seed and skip re-seeding.
