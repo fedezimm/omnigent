@@ -410,6 +410,25 @@ def _hosts_body() -> str:
     )
 
 
+# Two online hosts for the sticky-default test. The composer auto-selects the
+# FIRST online host (alpha) when there's no stored pick; the test then picks
+# beta and asserts it's restored after a reload.
+_HOST_ALPHA = ("host_e2e_alpha", "e2e-host-alpha")
+_HOST_BETA = ("host_e2e_beta", "e2e-host-beta")
+
+
+def _two_hosts_body() -> str:
+    """Stub body for ``GET /v1/hosts``: two online, user-connected hosts."""
+    return json.dumps(
+        {
+            "hosts": [
+                {"host_id": hid, "name": name, "owner": "e2e", "status": "online"}
+                for hid, name in (_HOST_ALPHA, _HOST_BETA)
+            ]
+        }
+    )
+
+
 async def _register_common_routes(
     page,
     *,
@@ -569,6 +588,89 @@ async def _drive_permission_mode(base_url: str, session_id: str) -> None:
             assert body["host_id"] == _HOST_ID, body
             assert body["workspace"] == "/work/repo", body
             assert body.get("terminal_launch_args") == ["--permission-mode", "acceptEdits"], body
+        finally:
+            await browser.close()
+
+
+def test_start_session_remembers_last_picked_host(seeded_session: tuple[str, str]) -> None:
+    """The host chip restores the last explicitly-picked host after a reload.
+
+    With no stored pick the composer auto-selects the first online host
+    (alpha). After the user picks a different host (beta), that choice must be
+    persisted (``omnigent:last-host-choice`` in localStorage) and restored on
+    the next visit — instead of reverting to the first-online default. This is
+    the OSS mirror of the managed complaint where the picker always reverted to
+    the "Databricks Sandbox" default.
+    """
+    base_url, session_id = seeded_session
+    _run_in_fresh_loop(_drive_remembers_last_picked_host(base_url, session_id))
+
+
+async def _drive_remembers_last_picked_host(base_url: str, session_id: str) -> None:
+    alpha_id, alpha_name = _HOST_ALPHA
+    beta_id, beta_name = _HOST_BETA
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        page = await browser.new_page()
+        try:
+            create_bodies: list[dict[str, Any]] = []
+            await _register_common_routes(
+                page, created_session_id=session_id, create_bodies=create_bodies
+            )
+
+            # Override the single-host stub with the two-host body (registered
+            # after the common routes so this handler wins).
+            async def handle_two_hosts(route: Route) -> None:
+                await route.fulfill(
+                    status=200, content_type="application/json", body=_two_hosts_body()
+                )
+
+            await page.route("**/v1/hosts", handle_two_hosts)
+
+            # Neutralize agent discovery so a leaked native agent from another
+            # test can't switch the picker mid-flow (see _drive_permission_mode).
+            async def handle_agent_scan(route: Route) -> None:
+                await route.fulfill(
+                    status=200, content_type="application/json", body=json.dumps({"data": []})
+                )
+
+            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+
+            # Seed recents for both hosts so the working-directory chip auto-fills
+            # and the composer never blocks on the (host-less) file browser.
+            await page.add_init_script(
+                f"""window.localStorage.setItem(
+                    "omnigent:recent-workspaces",
+                    JSON.stringify({{
+                        "{alpha_id}": ["/work/repo"],
+                        "{beta_id}": ["/work/repo"]
+                    }})
+                );"""
+            )
+
+            await page.goto(f"{base_url}/")
+            await page.get_by_test_id("new-chat-landing-input").wait_for(
+                state="visible", timeout=30_000
+            )
+
+            chip = page.get_by_test_id("new-chat-landing-host-chip")
+            # No stored pick yet → auto-selects the first online host (alpha).
+            await expect(chip).to_contain_text(alpha_name)
+
+            # Explicitly pick the second host.
+            await chip.click()
+            await page.get_by_test_id(f"new-chat-landing-host-{beta_id}").click()
+            await expect(chip).to_contain_text(beta_name)
+
+            # Reload: a full document load resets the in-memory landing draft, so
+            # the only thing that can restore the pick is the persisted
+            # preference. The chip must come back on beta, NOT the alpha default.
+            await page.goto(f"{base_url}/")
+            await page.get_by_test_id("new-chat-landing-input").wait_for(
+                state="visible", timeout=30_000
+            )
+            chip = page.get_by_test_id("new-chat-landing-host-chip")
+            await expect(chip).to_contain_text(beta_name)
         finally:
             await browser.close()
 
