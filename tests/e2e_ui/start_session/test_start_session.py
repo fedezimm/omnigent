@@ -675,6 +675,130 @@ async def _drive_remembers_last_picked_host(base_url: str, session_id: str) -> N
             await browser.close()
 
 
+def _managed_info_body() -> str:
+    """Stub body for ``GET /v1/info``: a managed deployment offering a sandbox.
+
+    ``managed_sandboxes_enabled: true`` + ``sandbox_provider: "lakebox"`` makes
+    the picker offer (and default to) the "Databricks Sandbox" option, exactly
+    the deployment shape behind the original complaint. Every field the SPA
+    reads is supplied so the boot probe resolves to a fully-managed capability
+    set rather than the fail-closed sentinel.
+    """
+    return json.dumps(
+        {
+            "accounts_enabled": False,
+            "login_url": None,
+            "needs_setup": False,
+            "databricks_features": True,
+            "managed_sandboxes_enabled": True,
+            "sandbox_provider": "lakebox",
+            "server_version": "0.0.0-e2e",
+            "smart_routing_enabled": False,
+        }
+    )
+
+
+def test_start_session_managed_remembers_host_over_sandbox_default(
+    seeded_session: tuple[str, str],
+) -> None:
+    """In a managed deployment, a picked host survives reload — not the sandbox.
+
+    This is the original complaint end-to-end: the managed picker defaults to
+    "Databricks Sandbox", so a user who picks a connected host used to lose it
+    on the next visit (the picker reverted to the sandbox default). With the
+    last-host preference persisted, picking the host and reloading must restore
+    the host, NOT snap back to the sandbox default.
+    """
+    base_url, session_id = seeded_session
+    _run_in_fresh_loop(_drive_managed_remembers_host(base_url, session_id))
+
+
+async def _drive_managed_remembers_host(base_url: str, session_id: str) -> None:
+    host_id, host_name = _HOST_ALPHA
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        page = await browser.new_page()
+        try:
+            create_bodies: list[dict[str, Any]] = []
+            await _register_common_routes(
+                page, created_session_id=session_id, create_bodies=create_bodies
+            )
+
+            # Managed capability probe: makes the sandbox the offered default.
+            # `/v1/info` is fetched once per document load and module-cached, so
+            # a full reload re-hits this stub and re-enters managed mode.
+            async def handle_info(route: Route) -> None:
+                await route.fulfill(
+                    status=200, content_type="application/json", body=_managed_info_body()
+                )
+
+            await page.route("**/v1/info", handle_info)
+
+            # One connected online host alongside the managed sandbox default.
+            async def handle_one_host(route: Route) -> None:
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps(
+                        {
+                            "hosts": [
+                                {
+                                    "host_id": host_id,
+                                    "name": host_name,
+                                    "owner": "e2e",
+                                    "status": "online",
+                                }
+                            ]
+                        }
+                    ),
+                )
+
+            await page.route("**/v1/hosts", handle_one_host)
+
+            # Neutralize agent discovery so a leaked native agent from another
+            # test can't switch the picker mid-flow (see _drive_permission_mode).
+            async def handle_agent_scan(route: Route) -> None:
+                await route.fulfill(
+                    status=200, content_type="application/json", body=json.dumps({"data": []})
+                )
+
+            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+
+            await page.add_init_script(
+                f"""window.localStorage.setItem(
+                    "omnigent:recent-workspaces",
+                    JSON.stringify({{ "{host_id}": ["/work/repo"] }})
+                );"""
+            )
+
+            await page.goto(f"{base_url}/")
+            await page.get_by_test_id("new-chat-landing-input").wait_for(
+                state="visible", timeout=30_000
+            )
+
+            chip = page.get_by_test_id("new-chat-landing-host-chip")
+            # Managed default with no stored pick: the sandbox, labeled by its
+            # provider ("Databricks Sandbox").
+            await expect(chip).to_contain_text("Databricks Sandbox")
+
+            # Explicitly pick the connected host instead.
+            await chip.click()
+            await page.get_by_test_id(f"new-chat-landing-host-{host_id}").click()
+            await expect(chip).to_contain_text(host_name)
+
+            # Reload: the host must be restored, NOT reverted to the sandbox
+            # default — the exact regression this change fixes.
+            await page.goto(f"{base_url}/")
+            await page.get_by_test_id("new-chat-landing-input").wait_for(
+                state="visible", timeout=30_000
+            )
+            chip = page.get_by_test_id("new-chat-landing-host-chip")
+            await expect(chip).to_contain_text(host_name)
+            await expect(chip).not_to_contain_text("Databricks Sandbox")
+        finally:
+            await browser.close()
+
+
 def test_start_session_select_model_and_effort(seeded_session: tuple[str, str]) -> None:
     """Picking a model + reasoning effort rides along to the create call.
 

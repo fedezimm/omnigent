@@ -2022,6 +2022,9 @@ export function NewChatLandingScreen() {
     if (sandboxSelected) return;
     if (selectedHostId !== null) return;
 
+    // Read the persisted pick once, as a mount-time seed — deliberately NOT a
+    // dependency: it only matters until the slot is filled, and re-running on
+    // its value would fight an explicit in-session selection.
     const lastChoice = readLastHostChoice();
     if (lastChoice === SANDBOX_HOST_CHOICE) {
       // Wait for the server-info probe before acting on a sandbox pick: until
