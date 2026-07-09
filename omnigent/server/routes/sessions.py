@@ -3247,7 +3247,7 @@ def _persist_native_cumulative_usage(
     # delta negative (clawing back already-spent budget). Monotonicity makes a
     # downward report a no-op, so the worst a forged post can do is leave the
     # figure unchanged. (See also the runner-token guard on cost_control.*
-    # label writes in ``cost_advisor`` — usage was the missing half.)
+    # label writes — usage was the missing half.)
     old_cost = float(current.get("total_cost_usd", 0.0) or 0.0)
     old_policy_cost = float(current.get("policy_cost_usd", 0.0) or 0.0)
     if cin is not None:

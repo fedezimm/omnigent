@@ -487,8 +487,8 @@ class RoutingDecisionData(BaseModel):
     """
     Data payload for an intelligent model-router decision item.
 
-    Emitted by the runner's per-turn cost advisor at the START of an
-    advised turn (see :func:`omnigent.runner.cost_advisor`) and persisted
+    Emitted by the server-side smart routing path at the START of an
+    advised turn and persisted
     as a display-only transcript item so the model the router chose shows
     in the conversation flow the moment the turn begins. Listed in
     :data:`NON_CONTENT_ITEM_TYPES` so the agent loop's history filter
