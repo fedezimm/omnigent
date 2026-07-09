@@ -57,7 +57,7 @@ latency run), `--requests N` / `--concurrency N` (throughput), `--runs N`,
 | `get_session` | `GET /v1/sessions/{id}` — single-session snapshot | (O(1)) |
 | `load_conversation_history` | `GET /v1/sessions/{id}/items` — history read | items/session |
 | `search_sessions` | `GET /v1/sessions?search_query=` — unindexed `LIKE` | total item count |
-| `fork_session` | `POST /v1/sessions/{id}/fork` then `DELETE` — fork (deep-copy items) | items/session |
+| `fork_session` | `POST /v1/sessions/{id}/fork` — fork (deep-copy items); forks deleted in teardown, untimed | items/session |
 | `add_comment` | `POST /v1/sessions/{id}/comments` — create a review comment | write path |
 
 Read journeys target a **pre-seeded** session when the DB has a corpus; against

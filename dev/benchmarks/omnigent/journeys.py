@@ -260,16 +260,42 @@ async def _measure_load_history(env: BenchEnvironment, ctx: JourneyContext) -> N
     resp.raise_for_status()
 
 
+@dataclass
+class _ForkContext:
+    """Fork-journey context: the session to fork + the forks to clean up.
+
+    ``measure`` records each fork's id here instead of deleting it inline, so
+    the DELETE stays out of the timed span; ``teardown`` removes them after.
+    """
+
+    source_id: str
+    fork_ids: list[str]
+
+
+async def _setup_fork_session(env: BenchEnvironment) -> _ForkContext:
+    """Resolve a session to fork; start an empty fork-id collector."""
+    source_id = await _setup_target_session(env)
+    return _ForkContext(source_id=source_id, fork_ids=[])
+
+
 async def _measure_fork_session(env: BenchEnvironment, ctx: JourneyContext) -> None:
     assert env.client is not None
-    session_id = cast(str, ctx)  # _setup_target_session
-    forked = await env.client.post(f"/v1/sessions/{session_id}/fork", json={})
+    fork_ctx = cast(_ForkContext, ctx)  # _setup_fork_session
+    forked = await env.client.post(f"/v1/sessions/{fork_ctx.source_id}/fork", json={})
     forked.raise_for_status()
-    # Delete the fork inline so a long run doesn't accumulate forked sessions +
-    # copied items; the POST (a deep-copy of the source's items) is the
-    # operation of interest and dominates the timed span.
-    deleted = await env.client.delete(f"/v1/sessions/{forked.json()['id']}")
-    deleted.raise_for_status()
+    # Record the fork for teardown; deleting it here would fold the DELETE into
+    # the timed span. The fork POST (a deep-copy of the source's items) is the
+    # operation of interest.
+    fork_ctx.fork_ids.append(forked.json()["id"])
+
+
+async def _teardown_fork_session(env: BenchEnvironment, ctx: JourneyContext) -> None:
+    """Delete every fork created during the run (best effort, untimed)."""
+    assert env.client is not None
+    fork_ctx = cast(_ForkContext, ctx)
+    for fork_id in fork_ctx.fork_ids:
+        with contextlib.suppress(httpx.HTTPError):
+            await env.client.delete(f"/v1/sessions/{fork_id}")
 
 
 # Anchor snapshot for the comment journey; the offsets below span it.
@@ -455,9 +481,10 @@ ALL_JOURNEYS: dict[str, Journey] = {
             name="fork_session",
             kind="latency",
             measure=_measure_fork_session,
-            setup=_setup_target_session,
+            setup=_setup_fork_session,
+            teardown=_teardown_fork_session,
             concurrency_safe=True,
-            description="POST /v1/sessions/{id}/fork then DELETE — session fork (deep-copy).",
+            description="POST /v1/sessions/{id}/fork — session fork (deep-copy); DELETE untimed.",
         ),
         Journey(
             name="add_comment",
