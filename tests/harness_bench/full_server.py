@@ -142,15 +142,20 @@ def _wait_server_runner_ready(base_url: str, runner_id: str) -> None:
 
 
 def _build_bench_agent_config(
-    profile: BenchProfile, db_profile: str | None, *, deny: bool
+    profile: BenchProfile, db_profile: str | None, *, policy_action: str | None = None
 ) -> dict[str, Any]:
     """The agent spec for a bench harness: the harness + the read-only builtin,
-    plus (when *deny*) a baked tool_call-phase deny on that builtin."""
+    plus (when *policy_action* is set) a baked tool_call-phase policy with that
+    fixed action (``"allow"`` / ``"deny"`` / ``"ask"``) on that builtin.
+
+    ``make_fixed_action_callable`` is not on the REST policy allowlist, so the
+    policy must ride in the agent spec (this path) rather than a live
+    ``POST /policies`` attach."""
     # The agent name must match [a-zA-Z0-9_-]+, but a harness id can contain a
     # colon (acp:<slug>). Sanitize it for the name only; config.harness keeps
     # the real id so the runner resolves the right ACP agent at spawn.
     safe_harness = profile.harness.replace(":", "-")
-    name = f"bench-{safe_harness}" + ("-deny" if deny else "")
+    name = f"bench-{safe_harness}" + (f"-{policy_action}" if policy_action else "")
     executor: dict[str, Any] = {
         "type": "omnigent",
         "model": profile.model,
@@ -171,15 +176,15 @@ def _build_bench_agent_config(
         # turns (the model just won't call it).
         "tools": {"builtins": [_TOOL_NAME]},
     }
-    if deny:
+    if policy_action:
         config["guardrails"] = {
             "policies": {
-                "deny_tool": {
+                f"{policy_action}_tool": {
                     "type": "function",
                     "function": {
                         "path": "omnigent.policies.function.make_fixed_action_callable",
                         "arguments": {
-                            "action": "deny",
+                            "action": policy_action,
                             "reason": _DENY_REASON,
                             "on_phases": ["tool_call"],
                             "on_tools": [_TOOL_NAME],
@@ -262,10 +267,14 @@ class SharedFullServer:
                     proc.kill()
         shutil.rmtree(self._tmp, ignore_errors=True)
 
-    def register_agent(self, profile: BenchProfile, *, deny: bool) -> str:
-        """Register a bench agent for *profile*; return its agent name."""
+    def register_agent(self, profile: BenchProfile, *, policy_action: str | None = None) -> str:
+        """Register a bench agent for *profile*; return its agent name.
+
+        *policy_action* (``"allow"`` / ``"deny"`` / ``"ask"`` or ``None``) bakes a
+        fixed-action tool_call policy into the agent spec so the policy probes can
+        force each verdict deterministically."""
         assert self.client is not None
-        config = _build_bench_agent_config(profile, self._db_profile, deny=deny)
+        config = _build_bench_agent_config(profile, self._db_profile, policy_action=policy_action)
         resp = self.client.post(
             "/v1/sessions",
             data={"metadata": json.dumps({})},

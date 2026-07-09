@@ -325,6 +325,14 @@ class NativeTuiDriver:
     async def run_tool_turn(self, *, deny: bool) -> TurnResult:
         return await asyncio.to_thread(self._drive_tool_turn, deny=deny)
 
+    async def run_policy_turn(self, *, action: str) -> TurnResult:
+        """Native ALLOW/ASK observation is a follow-up (would attach a CEL
+        ALLOW/ASK policy the way the DENY path attaches its CEL deny, and watch
+        for the tool proceeding / an elicitation). Not wired yet, so return an
+        unmeasured result and let the probe SKIP rather than report a false
+        verdict. Native Policy DENY remains covered by run_tool_turn(deny=True)."""
+        return TurnResult()
+
     async def run_interrupt_turn(self) -> TurnResult:
         return await asyncio.to_thread(self._drive_interrupt_turn)
 
