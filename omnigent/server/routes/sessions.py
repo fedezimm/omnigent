@@ -607,12 +607,12 @@ _CLAUDE_NATIVE_PERMISSION_HOOK_TIMEOUT_S = 86400.0
 _browser_action_registry: dict[str, asyncio.Future[dict[str, Any]]] = {}  # -> parked Future
 _browser_action_owners: dict[str, str] = {}  # -> issuing session_id (result POST must match)
 # -> claim_token: single-winner lease so fan-out to multiple renderers can't
-# double-execute (Risk-1); the result POST must present the matching token.
+# double-execute; the result POST must present the matching token.
 _browser_action_claims: dict[str, str] = {}
 
 # AP-side wait budget for an interactive browser action. MUST stay below the
 # runner's 60s read timeout (``_BROWSER_ACTION_TIMEOUT`` in tool_dispatch.py) so
-# the AP returns its own clean timeout JSON before the runner severs (Risk-4).
+# the AP returns its own clean timeout JSON before the runner severs the POST.
 _BROWSER_ACTION_AWAIT_S = 30.0
 
 # Returned (HTTP 200) when the await elapses with no renderer result (desktop app
@@ -18609,9 +18609,9 @@ def create_sessions_router(
         Atomically claim a parked browser action (one winner per action).
 
         The request event fans out to every subscribed renderer; an atomic
-        ``setdefault`` grants exactly one claim so they don't double-execute
-        (Risk-1). Winner gets ``{"claimed": true, "claim_token": <token>}``;
-        everyone else ``{"claimed": false}``.
+        ``setdefault`` grants exactly one claim so they don't double-execute.
+        Winner gets ``{"claimed": true, "claim_token": <token>}``; everyone
+        else ``{"claimed": false}``.
 
         :param request: The inbound request, used for identity extraction.
         :param session_id: Session/conversation identifier, e.g.

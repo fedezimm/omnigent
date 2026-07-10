@@ -337,8 +337,8 @@ _BROWSER_TOOLS = frozenset(
 # Runner-side outer HTTP read timeout for a browser action POST. The read
 # budget (60s) MUST exceed the AP-side browser-action await (30s) so the
 # runner never severs the still-open POST before the AP returns either the
-# action result JSON or the clean timeout-error JSON (design Risk-4 "timeout
-# budget"). Fast connect (30s) so an unreachable server still fails promptly.
+# action result JSON or the clean timeout-error JSON. Fast connect (30s) so an
+# unreachable server still fails promptly.
 _BROWSER_ACTION_TIMEOUT = httpx.Timeout(60.0, connect=30.0)
 
 # Returned as the tool output (HTTP 200 body, not an exception) when the AP

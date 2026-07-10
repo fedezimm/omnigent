@@ -9,7 +9,7 @@ tool call to the desktop renderer and back:
   result or a clean timeout error.
 - ``POST /sessions/{id}/browser/action_claim/{action_id}`` — the atomic
   one-winner claim lease that prevents double execution when several
-  renderers are subscribed to the same session stream (design Risk-1).
+  renderers are subscribed to the same session stream.
 - ``POST /sessions/{id}/browser/action_result/{action_id}`` — the
   claim-token + owner guarded resolution.
 
@@ -227,14 +227,14 @@ async def test_action_request_resolves_on_result(client: httpx.AsyncClient) -> N
     assert resp.json() == {"final_url": "https://example.com/landed"}
 
 
-# ── atomic claim lease (Risk-1) ──────────────────────────────────
+# ── atomic claim lease ───────────────────────────────────────────
 
 
 async def test_two_concurrent_claims_exactly_one_winner(client: httpx.AsyncClient) -> None:
     """
     Two renderers claiming the same action concurrently → exactly one
-    ``{claimed: true}``. Guards the atomic check-and-set (design Risk-1:
-    double execution via session-stream fan-out).
+    ``{claimed: true}``. Guards the atomic check-and-set against double
+    execution via session-stream fan-out.
     """
     agent = await create_test_agent(client, "test-browser-claim-race")
     session_id = await _create_session(client, agent["id"])

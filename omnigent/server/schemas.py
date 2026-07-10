@@ -3326,8 +3326,7 @@ class BrowserActionRequestEvent(_SSEEventBase):
     first POSTs ``/browser/action_claim/{action_id}`` and only the
     winning claimant executes the action and POSTs the result back to
     ``/browser/action_result/{action_id}``. The claim lease prevents
-    double execution when more than one renderer is subscribed
-    (design Risk-1).
+    double execution when more than one renderer is subscribed.
 
     :param type: Always ``"browser.action_request"``.
     :param action_id: Unique correlation id for this request, e.g.
