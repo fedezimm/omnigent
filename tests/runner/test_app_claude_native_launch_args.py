@@ -14,7 +14,10 @@ from __future__ import annotations
 
 import pytest
 
-from omnigent.claude_native import ClaudeNativeUcodeConfig
+from omnigent.claude_native import (
+    ClaudeNativeUcodeConfig,
+    build_native_claude_terminal_env,
+)
 from omnigent.runner.app import _build_claude_native_base_args, _claude_terminal_env_unset
 
 
@@ -202,3 +205,25 @@ def test_native_launch_passes_synthesized_model_as_flag() -> None:
         terminal_launch_args=None,
     )
     assert args == ("--model", "gateway-served-claude")
+
+
+def test_build_native_claude_terminal_env_rejects_raw_key_on_helper_path() -> None:
+    """The env-build seam fails loud if a raw key rides the apiKeyHelper path.
+
+    ``_claude_terminal_env_unset`` strips the raw key from the terminal child
+    only because ``build_native_claude_terminal_env`` never emits one on the
+    helper path. Pin that invariant mechanically: if a future config injects a
+    raw ``ANTHROPIC_API_KEY`` into the terminal env while an ``apiKeyHelper`` is
+    configured, the build must raise rather than silently reintroduce Claude
+    Code's custom-API-key menu hang.
+    """
+    leaking = ClaudeNativeUcodeConfig(
+        env={
+            "ANTHROPIC_BASE_URL": "https://gateway.example/anthropic",
+            "ANTHROPIC_API_KEY": "sk-leaked",
+        },
+        api_key_helper="printf %s sk-gateway",
+        model="gateway-served-claude",
+    )
+    with pytest.raises(RuntimeError, match="ANTHROPIC_API_KEY"):
+        build_native_claude_terminal_env(leaking)
