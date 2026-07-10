@@ -453,9 +453,7 @@ Contributions are welcome. See [CONTRIBUTING.md](https://github.com/omnigent-ai/
 
 Adding or changing support for a harness (Claude, Codex, Cursor, OpenCode,
 Hermes, Pi, ...)? Run the [harness test bench](https://github.com/omnigent-ai/omnigent/tree/main/tests/harness_bench)
-to check its capability matrix against observed behavior — see
-[`docs/harness-bench-design.md`](https://github.com/omnigent-ai/omnigent/blob/main/docs/harness-bench-design.md)
-for the design and rationale.
+to check its capability matrix against observed behavior.
 
 
 ### Contributors
