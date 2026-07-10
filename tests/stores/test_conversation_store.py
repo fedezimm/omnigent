@@ -1111,6 +1111,50 @@ def test_list_conversations_search_query_content_only(
     assert page.data[0].id == conv.id
 
 
+def test_list_conversations_search_content_scoped_to_accessible(
+    conversation_store: SqlAlchemyConversationStore,
+    db_uri: str,
+) -> None:
+    """A content search scoped by ``accessible_by`` must not surface a session
+    the caller can't see, even when its body matches — the item scan is scoped
+    to the caller's visible sessions, matching the outer ACL filter."""
+    from omnigent.stores.permission_store.sqlalchemy_store import (
+        SqlAlchemyPermissionStore,
+    )
+
+    mine = conversation_store.create_conversation()
+    theirs = conversation_store.create_conversation()
+    for conv in (mine, theirs):
+        conversation_store.append(
+            conv.id,
+            [
+                NewConversationItem(
+                    type="message",
+                    response_id=f"resp_{conv.id}",
+                    data=MessageData(
+                        role="user",
+                        content=[{"type": "input_text", "text": "fix the deployment pipeline"}],
+                    ),
+                ),
+            ],
+        )
+
+    perms = SqlAlchemyPermissionStore(db_uri)
+    for user in ("alice@example.com", "bob@example.com"):
+        perms.ensure_user(user)
+    perms.grant("alice@example.com", mine.id, 4)
+    perms.grant("bob@example.com", theirs.id, 4)
+
+    ids = {
+        c.id
+        for c in conversation_store.list_conversations(
+            search_query="deployment", accessible_by="alice@example.com"
+        ).data
+    }
+    # Bob's session matches on content but isn't accessible to Alice.
+    assert ids == {mine.id}
+
+
 def test_list_conversations_search_snippet_on_content_match(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:

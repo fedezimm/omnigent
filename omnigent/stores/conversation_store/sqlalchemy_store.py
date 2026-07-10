@@ -1867,12 +1867,17 @@ class SqlAlchemyConversationStore(ConversationStore):
                 stmt = stmt.where(SqlConversation.agent_id == agent_id)
             if title is not None:
                 stmt = stmt.where(SqlConversation.title == title)
+            # ACL id-scopes, reused for both the outer conversation filter and
+            # (below) the content-search item scan so the LIKE never sweeps
+            # items in sessions the caller can't see.
+            accessible_ids = None
             if accessible_by is not None:
                 accessible_ids = select(SqlSessionPermission.conversation_id).where(
                     SqlSessionPermission.workspace_id == current_workspace_id(),
                     SqlSessionPermission.user_id == accessible_by,
                 )
                 stmt = stmt.where(SqlConversation.id.in_(accessible_ids))
+            owned_ids = None
             if owned_by is not None:
                 owned_ids = select(SqlSessionPermission.conversation_id).where(
                     SqlSessionPermission.workspace_id == current_workspace_id(),
@@ -1883,14 +1888,23 @@ class SqlAlchemyConversationStore(ConversationStore):
             if search_query:
                 pattern = f"%{search_query.lower()}%"
                 title_match = func.lower(SqlConversation.title).like(pattern)
-                content_match = SqlConversation.id.in_(
-                    select(SqlConversationItem.conversation_id)
-                    .where(
-                        SqlConversationItem.workspace_id == current_workspace_id(),
-                        func.lower(SqlConversationItem.search_text).like(pattern),
-                    )
-                    .distinct()
+                content_scan = select(SqlConversationItem.conversation_id).where(
+                    SqlConversationItem.workspace_id == current_workspace_id(),
+                    func.lower(SqlConversationItem.search_text).like(pattern),
                 )
+                # Scope the item scan to the caller's visible sessions. The
+                # outer query already ANDs these same id-sets, so this changes
+                # no results — it just stops the LIKE from scanning items in
+                # sessions the caller can't access.
+                if accessible_ids is not None:
+                    content_scan = content_scan.where(
+                        SqlConversationItem.conversation_id.in_(accessible_ids)
+                    )
+                if owned_ids is not None:
+                    content_scan = content_scan.where(
+                        SqlConversationItem.conversation_id.in_(owned_ids)
+                    )
+                content_match = SqlConversation.id.in_(content_scan.distinct())
                 stmt = stmt.where(or_(title_match, content_match))
             if project is not None:
                 if project == "":
