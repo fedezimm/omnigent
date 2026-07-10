@@ -60,13 +60,17 @@ class CostTrackingProbe(CapabilityProbe):
                 detail=detail,
             )
 
-        if result.total_cost_usd is not None:
+        # Require a POSITIVE value, not merely non-None: a completed turn always
+        # spends tokens, so a reported 0 cost / 0 tokens means the usage plumbing
+        # returned an empty default, not that tracking genuinely measured zero.
+        # Treating 0 as "supported" would be a false pass.
+        if result.total_cost_usd is not None and result.total_cost_usd > 0:
             return ProbeResult(
                 Verdict.SUPPORTED,
                 note=f"turn reported cost ${result.total_cost_usd:.6f}",
                 detail=detail,
             )
-        if result.total_tokens is not None:
+        if result.total_tokens is not None and result.total_tokens > 0:
             return ProbeResult(
                 Verdict.PARTIAL,
                 note=(
@@ -75,8 +79,8 @@ class CostTrackingProbe(CapabilityProbe):
                 ),
                 detail=detail,
             )
-        # Completed but no usage surfaced on this transport — not a capability
-        # gap we can assert, so SKIP with the reason.
+        # Completed but no positive usage surfaced (absent, or a zero default) —
+        # not a capability gap we can assert, so SKIP with the reason.
         return ProbeResult(
             Verdict.SKIPPED,
             note="turn completed but the transport surfaced no usage/cost to observe",

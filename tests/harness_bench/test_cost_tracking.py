@@ -56,6 +56,21 @@ async def test_no_usage_is_skipped() -> None:
     assert "no usage" in r.note
 
 
+async def test_zero_cost_and_tokens_is_skipped() -> None:
+    # A completed turn always spends tokens; a reported 0/0 means an empty
+    # default from the usage plumbing, not a genuine zero -> SKIP, not a false
+    # SUPPORTED/PARTIAL. Guards against the `is not None` false positive.
+    r = await _run(TurnResult(completed=True, text="ok", total_cost_usd=0.0, total_tokens=0))
+    assert r.verdict is Verdict.SKIPPED
+
+
+async def test_zero_cost_but_positive_tokens_is_partial() -> None:
+    # Cost defaulted to 0 (unpriced) but real tokens were counted -> PARTIAL,
+    # not a false SUPPORTED on the 0 cost.
+    r = await _run(TurnResult(completed=True, text="ok", total_cost_usd=0.0, total_tokens=900))
+    assert r.verdict is Verdict.PARTIAL
+
+
 async def test_infra_failure_is_skipped() -> None:
     r = await _run(TurnResult(failed=True, error={"message": "403 Forbidden"}))
     assert r.verdict is Verdict.SKIPPED
