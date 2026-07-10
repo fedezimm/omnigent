@@ -305,7 +305,8 @@ def build_policy_engine(
         child_names = {p.name for p in session_policy_specs}
         root_policy_specs = [p for p in root_policy_specs if p.name not in child_names]
         session_policy_specs = root_policy_specs + session_policy_specs
-    admin_policy_specs: list[PolicySpec] = list(default_policies or [])
+    db_default_policy_specs = _load_default_policy_specs(policy_store)
+    admin_policy_specs: list[PolicySpec] = db_default_policy_specs + list(default_policies or [])
     all_policy_specs = session_policy_specs + agent_policy_specs + admin_policy_specs
 
     # Always require user approval before sys_add_policy executes.
@@ -916,6 +917,31 @@ def _subtree_conversation_ids(
         subtree.add(node)
         stack.extend(children_by_parent.get(node, []))
     return subtree
+
+
+def _load_default_policy_specs(
+    policy_store: PolicyStore | None,
+) -> list[PolicySpec]:
+    """
+    Load enabled server-wide default policies from the store.
+
+    These are policies created via ``POST /v1/policies`` (``session_id IS
+    NULL``). They run after agent-spec policies and before YAML-based
+    admin policies in the evaluation order.
+
+    :param policy_store: The policy store. ``None`` returns an empty list.
+    :returns: List of :class:`FunctionPolicySpec` for enabled default
+        policies, in ``created_at ASC`` order.
+    :raises OmnigentError: If an enabled policy has an unsupported type.
+    """
+    if policy_store is None:
+        return []
+    specs: list[PolicySpec] = []
+    for policy in policy_store.list_defaults():
+        if not policy.enabled:
+            continue
+        specs.append(_stored_policy_to_spec(policy))
+    return specs
 
 
 def _load_session_policy_specs(
