@@ -217,6 +217,16 @@ class TurnResult:
         (``None`` when unobserved or the model is unpriced). Read from
         ``SessionResponse.total_cost_usd`` / ``session.usage`` /
         ``response.completed`` usage.
+    :param elicitation_requested: Whether an elicitation was raised during the
+        turn — the signal an ASK policy fired (server publishes
+        ``response.elicitation_request`` / lands a pending elicitation on the
+        snapshot). The policy_ask probe keys on this.
+    :param tool_call_allowed: Whether a surfaced tool call produced a
+        non-blocked ``function_call_output`` — i.e. the call proceeded. This is
+        set for *any* non-blocked tool output, not only under an ALLOW policy;
+        the policy_allow probe's correctness comes from driving a real
+        ``action=allow`` session (``_ensure_policy_session("allow")``), so a set
+        flag there means the ALLOW policy let the call through.
     """
 
     events: list[dict[str, Any]] = field(default_factory=list)
@@ -233,6 +243,8 @@ class TurnResult:
     timed_out: bool = False
     total_tokens: int | None = None
     total_cost_usd: float | None = None
+    elicitation_requested: bool = False
+    tool_call_allowed: bool = False
 
     @property
     def reached_terminal(self) -> bool:
@@ -438,6 +450,13 @@ class SdkInprocDriver:
             auto_tool_output="bench-tool-ok",
             timeout=150.0,
         )
+
+    async def run_policy_turn(self, *, action: str) -> TurnResult:
+        """The wrap-direct path has no server-side policy/elicitation surface, so
+        an explicit ALLOW/ASK verdict cannot be observed here. Return an
+        unmeasured result so the policy_allow / policy_ask probes SKIP (never a
+        false verdict), mirroring how Policy DENY reports on this transport."""
+        return TurnResult()
 
     async def run_interrupt_turn(self) -> TurnResult:
         return await self.run_turn(_LONG_PROMPT, interrupt_on_first_delta=True, timeout=120.0)

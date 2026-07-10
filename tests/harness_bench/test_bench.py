@@ -483,7 +483,7 @@ async def test_parallel_full_server_shares_one_server(monkeypatch: pytest.Monkey
         def __exit__(self, *exc: object) -> None:
             pass
 
-        def register_agent(self, profile, *, deny: bool) -> str:
+        def register_agent(self, profile, *, policy_action: str | None = None) -> str:
             self.registered.append(profile.harness)
             return f"bench-{profile.harness}"
 
@@ -504,7 +504,7 @@ async def test_parallel_full_server_shares_one_server(monkeypatch: pytest.Monkey
 
         async def __aenter__(self):
             assert self._shared is not None  # parallel run injected the shared server
-            self._shared.register_agent(self._profile, deny=False)
+            self._shared.register_agent(self._profile, policy_action=None)
             self._shared.create_session(f"bench-{self._profile.harness}")
             return self
 
