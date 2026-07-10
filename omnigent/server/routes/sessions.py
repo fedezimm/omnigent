@@ -20153,7 +20153,10 @@ def create_sessions_router(
         )
         # Server-wide sharing policy gate (see SharingMode). Applied only
         # to *new* grants — revoke/list and owner grants are unaffected.
-        _sharing_mode = request.app.state.sharing_mode()
+        # ``getattr`` default keeps a hand-built app (a router mounted without
+        # create_app, e.g. in a focused test) from AttributeError-ing; every
+        # production path sets these via create_app.
+        _sharing_mode = getattr(request.app.state, "sharing_mode", lambda: SharingMode.ON)()
         if _sharing_mode == SharingMode.OFF:
             raise OmnigentError(
                 "Sharing has been disabled for this Omnigent server.",
@@ -20191,8 +20194,9 @@ def create_sessions_router(
         if body.user_id == RESERVED_USER_PUBLIC:
             # Public-access kill switch, independent of the sharing_mode gate
             # above (see app.state.public_sharing). Blocks the anyone-with-the
-            # -link grant while leaving user-to-user sharing intact.
-            if not request.app.state.public_sharing():
+            # -link grant while leaving user-to-user sharing intact. ``getattr``
+            # default mirrors the sharing_mode read above (hand-built apps).
+            if not getattr(request.app.state, "public_sharing", lambda: True)():
                 raise OmnigentError(
                     "Public access has been disabled for this Omnigent server.",
                     code=ErrorCode.FORBIDDEN,
