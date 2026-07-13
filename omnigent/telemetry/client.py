@@ -103,14 +103,8 @@ def _config_telemetry_disabled() -> bool:
         with open(config_path) as f:
             cfg = yaml.safe_load(f) or {}
         tel = cfg.get("telemetry")
-        # Support both `telemetry: false` and `telemetry:\n  enabled: false`
-        if isinstance(tel, bool):
-            return not tel
-        if isinstance(tel, dict):
-            enabled = tel.get("enabled")
-            if isinstance(enabled, bool):
-                return not enabled
-        return False
+        # Only `telemetry: false` is supported.
+        return tel is False
     except Exception:
         return False
 
