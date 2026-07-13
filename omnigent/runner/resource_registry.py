@@ -72,37 +72,23 @@ OMNIGENT_REPL_TERMINAL_ROLE = "omnigent-repl"
 _IS_ALIVE_CACHE_TTL_S = 2.0
 _IS_ALIVE_CACHE_MAX = 256
 
-# Diff-track idle threshold (seconds) for the claude-native agent
-# terminal's status watcher. Claude Code redraws its busy line every
-# ~200ms while a turn is in progress, so a poll that sees no pane change
-# only happens once Claude has actually stopped — making a short
-# threshold safe against mid-turn false-idle. Kept distinct from the
-# generic terminal-activity watcher's longer default so the session's
-# "Working…" indicator flips to idle promptly (~1s) after Claude stops,
-# matching the responsiveness of the hook-based ``Stop`` edge it
-# replaces.
-_CLAUDE_NATIVE_STATUS_IDLE_THRESHOLD_SECONDS = 1.0
+# Diff-track idle threshold (seconds) for native agent terminals whose working
+# status is still pane-derived. Claude native is deliberately not in that set:
+# its busy state comes from Claude Code hooks instead.
+_NATIVE_STATUS_IDLE_THRESHOLD_SECONDS = 1.0
 
-# Poll interval (seconds) for the claude-native agent terminal's status
-# watcher. Tighter than the generic terminal-activity watcher's 1s so the
-# session's running/idle transitions feel responsive (~200ms) and so a
-# pane change can be attributed to a recent client interaction within a
-# tight window. Applied ONLY to this watcher (gated by the role) so we
-# don't 5x the capture-pane subprocess load on every terminal.
-_CLAUDE_NATIVE_STATUS_POLL_INTERVAL_SECONDS = 0.2
+# Poll interval (seconds) for native agent terminals whose working status is
+# still pane-derived. Tighter than the generic terminal-activity watcher so
+# their running/idle transitions remain responsive without increasing
+# capture-pane load for ordinary terminals.
+_NATIVE_STATUS_POLL_INTERVAL_SECONDS = 0.2
 
 # Minimum wall-clock interval (seconds) between consecutive
-# ``session.terminal.activity`` emissions for a single terminal. The
-# claude-native agent terminal polls its pane every 200ms
-# (:data:`_CLAUDE_NATIVE_STATUS_POLL_INTERVAL_SECONDS`) and Claude redraws
-# its busy line on nearly every poll, so emitting an event on every
-# pane-changed tick would push ~5 activity events/second for the whole
-# turn. The web only needs a pulse inside its 1.5s "active" window
-# (``ACTIVE_OUTPUT_WINDOW_MS`` in ``useTerminalStatuses``) to keep the
-# badge lit, so coalescing to at most one emit per second cuts the event
-# volume ~5x while keeping the badge solid. Generic terminals already poll
-# at 1s, so this throttle is a no-op for them (their own poll spacing
-# already exceeds the threshold).
+# ``session.terminal.activity`` emissions for a single terminal. Some native
+# agent terminals poll their panes faster than ordinary shells; the web only
+# needs a pulse inside its 1.5s "active" window
+# (``ACTIVE_OUTPUT_WINDOW_MS`` in ``useTerminalStatuses``), so coalescing to at
+# most one emit per second avoids redundant traffic while keeping the badge lit.
 _TERMINAL_ACTIVITY_EMIT_MIN_INTERVAL_SECONDS = 1.0
 _TERMINAL_EXIT_OUTPUT_MAX_LINES = 40
 _TERMINAL_EXIT_OUTPUT_MAX_CHARS = 4000
@@ -130,10 +116,10 @@ class TerminalExitEvent:
         specs may contain credentials or other launch-only secrets.
     :param cwd: Working directory used to launch the terminal, if known.
     :param last_output: Last visible pane text captured before exit, if any.
-    :param session_was_idle: Whether the session's last PTY-derived status was
+    :param session_was_idle: Whether the session's last observed status was
         ``idle`` at exit. ``True`` marks a clean shutdown after the turn
-        finished; ``False`` (the default — last seen ``running``, or never
-        observed) keeps a mid-turn crash or boot failure a failure.
+        finished; ``False`` (the default — last seen ``running`` / ``waiting``,
+        or never observed) keeps a mid-turn crash or boot failure a failure.
     """
 
     session_id: str
@@ -285,17 +271,14 @@ class SessionResourceRegistry:
         # Set by the runner via :meth:`set_terminal_activity_publisher`.
         self._terminal_activity_publisher: Callable[[str, str], None] | None = None
         # Optional callback ``(session_id, status) -> None`` invoked (on
-        # the event loop) when the claude-native *agent* terminal's pane
-        # crosses an activity/idle edge, so the runner can emit a
-        # ``session.status`` event. This is the PTY-activity-derived
-        # working status that replaces the hook-based ``UserPromptSubmit``
-        # → running / ``Stop`` → idle bracketing. Set by the runner via
-        # :meth:`set_session_status_publisher`.
+        # the event loop) when a pane-status-owned native terminal crosses an
+        # activity/idle edge, so the runner can emit a ``session.status`` event.
+        # Claude native does not use this path; its busy state is hook-derived.
         self._session_status_publisher: Callable[[str, str], None] | None = None
-        # Latest PTY-derived status (running/idle) per session. Lets
+        # Latest observed status (running/idle/waiting) per session. Lets
         # :meth:`_handle_terminal_exit` tell a clean shutdown (idle) from a
         # mid-turn crash. Written from the watcher thread and the turn-start
-        # hook; all access goes through the ``_*_session_status_memo`` helpers
+        # / external-status hooks; all access goes through the ``_*_session_status_memo`` helpers
         # under ``self._lock``.
         self._last_session_status: dict[str, str] = {}
         # Optional callback invoked on the event loop when a watched terminal
@@ -324,15 +307,15 @@ class SessionResourceRegistry:
         self,
         publisher: Callable[[str, str], None],
     ) -> None:
-        """Install the PTY-activity-derived session-status publisher.
+        """Install the pane-derived session-status publisher.
 
         The runner passes a callback that publishes a ``session.status``
         event onto the session's SSE queue (which the Omnigent server relays
         through its normal status path). It is invoked on the event loop
         (the watcher thread hops via ``loop.call_soon_threadsafe``), so
         the callback itself may use the loop-only ``_publish_event``
-        directly. Only the claude-native agent terminal's watcher calls
-        it — see :meth:`_start_terminal_activity_watcher`.
+        directly. Only native roles that still lack structured lifecycle
+        events call it — see :meth:`_start_terminal_activity_watcher`.
 
         :param publisher: Callable ``(session_id, status) -> None`` where
             *status* is ``"running"`` or ``"idle"``.
@@ -361,22 +344,23 @@ class SessionResourceRegistry:
         self._terminal_exit_publisher = publisher
 
     def _set_session_status_memo(self, session_id: str, status: str) -> None:
-        """Record the session's latest PTY status for exit classification."""
+        """Record the session's latest observed status for exit classification."""
         with self._lock:
             self._last_session_status[session_id] = status
 
     def _take_session_status_memo(self, session_id: str) -> str | None:
-        """Pop and return the session's recorded PTY status (or ``None``)."""
+        """Pop and return the session's recorded status (or ``None``)."""
         with self._lock:
             return self._last_session_status.pop(session_id, None)
 
     def note_session_turn_started(self, session_id: str) -> None:
         """Mark a session as having an in-flight turn.
 
-        Closes the window between a new turn starting and the watcher's first
-        ``running`` edge: without it, a crash in that gap would read the prior
-        turn's stale ``idle`` and be misclassified as a clean shutdown. The
-        watcher flips the memo back to ``idle`` once the turn completes.
+        Closes the window between a new native turn starting and its first
+        structured or pane-derived ``running`` edge: without it, a crash in
+        that gap would read the prior turn's stale ``idle`` and be
+        misclassified as a clean shutdown. The status owner flips the memo back
+        to ``idle`` once the turn completes.
 
         :param session_id: Session/conversation identifier, e.g. ``"conv_abc"``.
         """
@@ -385,10 +369,10 @@ class SessionResourceRegistry:
     def note_external_session_status(self, session_id: str, status: str) -> None:
         """Record a terminal-observed external status for exit classification.
 
-        Structured native forwarders can know turn completion more reliably than
-        a PTY diff heuristic. Keep the required-terminal exit memo aligned so a
-        terminal that closes after a forwarded ``idle`` edge is treated as a
-        clean shutdown, while ``running`` / ``waiting`` still classify a later
+        Structured native forwarders can know turn completion more reliably
+        than a pane diff heuristic. Keep the required-terminal exit memo aligned
+        so a terminal that closes after a forwarded ``idle`` edge is treated as
+        a clean shutdown, while ``running`` / ``waiting`` still classify a later
         exit as mid-turn.
 
         :param session_id: Session/conversation identifier, e.g. ``"conv_abc"``.
@@ -955,15 +939,13 @@ class SessionResourceRegistry:
         aligned with the underlying tmux process. No-op when no publisher
         is installed (e.g. embedded/test runners).
 
-        For the claude-native *agent* terminal (``resource_role`` ==
-        :data:`CLAUDE_NATIVE_TERMINAL_ROLE` or
-        :data:`PI_NATIVE_TERMINAL_ROLE`) the same watcher also drives the
-        session's working status: pane activity → ``running`` and a short
-        quiescence → ``idle``, emitted via the session-status publisher.
-        This PTY-derived status catches cases lifecycle hooks can miss
-        because it observes the terminal directly. The status edges are
-        gated to these roles so a side shell's output never flips the
-        session's status.
+        For native agent terminals that still lack a structured lifecycle
+        source, the same watcher also drives the session's working status: pane
+        activity → ``running`` and a short quiescence → ``idle``, emitted via
+        the session-status publisher. Claude native is not status-owned by this
+        watcher; its ``UserPromptSubmit`` / ``Stop`` / ``StopFailure`` hooks own
+        busy state. Status edges are gated to known native roles so a side
+        shell's output never flips the session's status.
 
         :param session_id: Session/conversation identifier.
         :param terminal_name: Terminal name from the agent spec.
@@ -983,10 +965,9 @@ class SessionResourceRegistry:
         # Status edges are derived only from native agent terminals — a
         # generic shell's output must not move the session's working status.
         emit_status = status_publisher is not None and resource_role in {
-            CLAUDE_NATIVE_TERMINAL_ROLE,
             PI_NATIVE_TERMINAL_ROLE,
             # cursor-native has no forwarder/hook (run_turn returns immediately
-            # after the paste), so — like pi/claude — the PTY watcher is its only
+            # after the paste), so — like pi — the PTY watcher is its only
             # status source. Without this the web "Working…" badge never clears.
             CURSOR_NATIVE_TERMINAL_ROLE,
             KIRO_NATIVE_TERMINAL_ROLE,
@@ -999,7 +980,7 @@ class SessionResourceRegistry:
             QWEN_NATIVE_TERMINAL_ROLE,
             # kimi-native also has no forwarder/hook (the injection run_turn
             # returns right after the tmux paste), so the PTY watcher is its
-            # only running/idle status source — same as cursor/pi/claude.
+            # only running/idle status source — same as cursor/pi.
             KIMI_NATIVE_TERMINAL_ROLE,
             # hermes-native injects then returns (its forwarder only mirrors the
             # SQLite transcript, not status), so the PTY watcher is its status
@@ -1013,9 +994,8 @@ class SessionResourceRegistry:
 
         # Last status edge emitted for this terminal, mutated only on the
         # watcher daemon thread (single-threaded), so the running/idle
-        # transition is deduped without a lock. Scoped to this watcher's
-        # lifetime, so a fresh terminal gets a fresh baseline — no stale
-        # cross-launch state to clean up.
+        # transition is deduped without a lock. Unused for Claude native
+        # because Claude status is structured-hook-derived.
         last_status: dict[str, str | None] = {"value": None}
         # Monotonic time of the last activity pulse published for this
         # terminal, mutated only on the watcher daemon thread (so no lock),
@@ -1028,11 +1008,9 @@ class SessionResourceRegistry:
             # Runs on the watcher daemon thread; hop to the loop so the
             # loop-only publishers (queue.put_nowait) are touched safely.
             #
-            # Throttle the activity pulse to one per second: the
-            # claude-native pane changes on nearly every 200ms poll while
-            # Claude works, but the web badge only needs a pulse inside its
-            # 1.5s window — emitting on every tick would push ~5 events/sec
-            # of redundant traffic.
+            # Throttle the activity pulse to one per second: the web badge
+            # only needs a pulse inside its 1.5s window, so emitting on every
+            # changed tick would be redundant traffic.
             if activity_publisher is not None:
                 now = _monotonic()
                 previous = last_activity_emit["value"]
@@ -1042,9 +1020,9 @@ class SessionResourceRegistry:
                 ):
                     last_activity_emit["value"] = now
                     loop.call_soon_threadsafe(activity_publisher, session_id, resource_id)
-            # Pane changed → the agent is working. Coalesce to the
-            # idle→running edge so a continuously-redrawing pane doesn't
-            # re-emit ``running`` every poll.
+            # For pane-status-owned native roles, pane changed → the agent is
+            # working. Coalesce to the idle→running edge so a continuously
+            # redrawing pane doesn't re-emit ``running`` every poll.
             if emit_status and status_publisher is not None and last_status["value"] != "running":
                 last_status["value"] = "running"
                 # Track for exit classification: a pane exit now reads as a crash.
@@ -1097,9 +1075,9 @@ class SessionResourceRegistry:
             return
 
         def _on_idle() -> None:
-            # Pane quiet for the claude-native status threshold → the
-            # agent has stopped. Edge-triggered: re-arms only after new
-            # output mutates the pane (which flips back to ``running``).
+            # Pane quiet for the native status threshold → the agent has
+            # stopped. Edge-triggered: re-arms only after new output mutates
+            # the pane (which flips back to ``running``).
             if status_publisher is not None and last_status["value"] != "idle":
                 last_status["value"] = "idle"
                 # Track for exit classification: a pane exit now reads as clean.
@@ -1108,18 +1086,16 @@ class SessionResourceRegistry:
                 self._set_session_status_memo(session_id, "idle")
                 loop.call_soon_threadsafe(status_publisher, session_id, "idle")
             # Clear the activity throttle so the next working episode emits
-            # its first pulse immediately, keeping the activity badge
-            # aligned with the running-status edge (which also re-fires on
-            # the next pane change) rather than lagging up to a second
-            # behind it.
+            # its first pulse immediately, keeping the activity badge aligned
+            # with the running-status edge rather than lagging up to a second.
             last_activity_emit["value"] = None
 
         instance.start_idle_watcher_thread(
             on_activity=_on_activity,
             on_idle=_on_idle,
             on_exit=_on_exit,
-            idle_threshold_s=_CLAUDE_NATIVE_STATUS_IDLE_THRESHOLD_SECONDS,
-            poll_interval_s=_CLAUDE_NATIVE_STATUS_POLL_INTERVAL_SECONDS,
+            idle_threshold_s=_NATIVE_STATUS_IDLE_THRESHOLD_SECONDS,
+            poll_interval_s=_NATIVE_STATUS_POLL_INTERVAL_SECONDS,
             replace=replace,
         )
 
@@ -1265,7 +1241,7 @@ class SessionResourceRegistry:
                 lifecycle = self._terminal_lifecycles.pop((source_session_id, terminal_id), None)
                 if lifecycle is not None:
                     self._terminal_lifecycles[(target_session_id, terminal_id)] = lifecycle
-            # Move the PTY-status memo with the pane so a post-transfer exit is
+            # Move the status memo with the pane so a post-transfer exit is
             # classified against the right session. Don't clobber a status the
             # target already has from its own terminal.
             with self._lock:

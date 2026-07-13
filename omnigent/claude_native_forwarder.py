@@ -236,18 +236,14 @@ _SUPERVISOR_HEALTHY_UPTIME_S = 60.0
 # published on the per-conversation SSE stream. Unmapped events emit
 # no status.
 #
-# ``Stop`` → idle and ``StopFailure`` → failed are the authoritative
-# turn-end edges (each fires once when Claude finishes / errors a turn);
-# they drive sub-agent terminal delivery via the codex-shared
-# ``external_session_status`` path (→ parent inbox + wake). The
-# PTY-activity ``idle`` cannot: it is a ~1s-quiescence heuristic that
-# oscillates on every mid-turn lull, so delivering on it fired a
-# premature completion and idempotently locked out the real one.
-# ``UserPromptSubmit`` → running stays PTY-derived — the pane watcher
-# drives the UI running/idle badge and catches what ``Stop`` misses
-# (interrupts, compaction failures, TUI edits). ``_publish_status``
-# keeps ``failed`` sticky against the trailing PTY idle.
+# ``UserPromptSubmit`` → running, ``Stop`` → idle, and ``StopFailure`` →
+# failed are the authoritative parent-turn lifecycle edges. They drive the
+# Omnigent busy state and sub-agent terminal delivery via the codex-shared
+# ``external_session_status`` path (→ parent inbox + wake). The tmux pane
+# watcher is intentionally not a Claude busy source: a quiescence heuristic can
+# oscillate on mid-turn lulls and does not carry Claude's background-task count.
 _HOOK_EVENT_TO_STATUS: dict[str, str] = {
+    "UserPromptSubmit": "running",
     "Stop": "idle",
     "StopFailure": "failed",
 }
@@ -2529,12 +2525,12 @@ async def _forward_available_status_events(
     """
     Forward currently available hook events as ``session.status``.
 
-    Maps ``Stop`` → ``idle`` and ``StopFailure`` → ``failed`` via
-    ``POST /v1/sessions/{id}/events`` with type ``external_session_status``
-    — the authoritative turn-end edges that drive sub-agent terminal
-    delivery (see :data:`_HOOK_EVENT_TO_STATUS`). ``running`` stays
-    PTY-derived (the pane-activity watcher drives the UI badge). Other hook
-    event names advance the cursor without emitting (no status meaning).
+    Maps ``UserPromptSubmit`` → ``running``, ``Stop`` → ``idle``, and
+    ``StopFailure`` → ``failed`` via ``POST /v1/sessions/{id}/events`` with
+    type ``external_session_status`` — the authoritative parent-turn lifecycle
+    edges that drive Claude native busy state and sub-agent terminal delivery
+    (see :data:`_HOOK_EVENT_TO_STATUS`). Other hook event names advance the
+    cursor without emitting (no status meaning).
 
     Also forwards native task state changes (``TaskCreated``,
     ``TaskCompleted``, ``PostToolUse``/``TaskUpdate``) and
@@ -2560,9 +2556,9 @@ async def _forward_available_status_events(
         e.g. ``["1", "2", "3"]``. Appended in-place from ``TaskCreated``
         events. Used to render the task list in a stable order.
     :param response_id: Active turn's response id, stamped on the
-        ``Stop``→``idle`` / ``StopFailure``→``failed`` edges so ap-web
-        closes the streaming ``activeResponse`` opened by the matching
-        turn-start ``running`` edge. ``None`` when no turn id is known
+        ``Stop``→``idle`` / ``StopFailure``→``failed`` edges so ap-web closes
+        the streaming ``activeResponse`` opened by the matching id-bearing
+        assistant-output ``running`` edge. ``None`` when no turn id is known
         (the status still posts, just without a turn association).
     :returns: Updated state. On post failure, returns the last
         durable state so successfully-posted statuses are not
@@ -2594,12 +2590,9 @@ async def _forward_available_status_events(
             ),
         )
         # Subagent lifecycle hooks land in the same hooks.jsonl as parent
-        # events because subagent processes inherit the parent's hook
-        # settings. With running/idle now PTY-derived, the only mapped
-        # status left is ``StopFailure`` → ``failed``: a subagent's
-        # failure must NOT flip the parent session to ``failed`` — the
-        # parent turn is still running while it awaits the Agent tool
-        # result.
+        # events because subagent processes inherit the parent's hook settings.
+        # They must not flip the parent running/idle/failed: the parent turn is
+        # still running while it awaits the Agent tool result.
         if status is not None and _is_subagent_hook_record(record):
             _logger.debug(
                 "Skipping subagent hook status; session=%s event=%s status=%s transcript=%s",
@@ -2726,14 +2719,12 @@ async def _forward_available_status_events(
                 client,
                 session_id=session_id,
                 status=effective_status,
-                response_id=response_id,
+                response_id=None if status == "running" else response_id,
                 # Only the ``Stop`` (idle/waiting) edge carries an authoritative
                 # background-shell count — ``0`` clears the tally, ``N`` sets it.
-                # ``StopFailure`` (failed) clears it on the server regardless, so
-                # leave its count off the wire.
-                background_task_count=(
-                    None if status == "failed" else record.background_task_count
-                ),
+                # ``UserPromptSubmit`` (running) and ``StopFailure`` (failed)
+                # clear stale tallies on the server without a count.
+                background_task_count=(record.background_task_count if status == "idle" else None),
             )
         except httpx.HTTPError as exc:
             decision = retry_tracker.record_failure(retry_key, exc)
@@ -2908,18 +2899,17 @@ async def _forward_available_items(
     seen_source_ids = list(state.seen_source_ids)
     seen = set(seen_source_ids)
     # NOTE: the old "re-assert running on resumed agent output" hack lived
-    # here. It only existed to paper over the hook model's compaction
-    # blind spot (``Stop`` → idle, then an ``isCompactSummary`` resume that
-    # never fired ``UserPromptSubmit``). PTY-activity status makes it
-    # obsolete: the pane keeps changing through a mid-turn compaction, so
-    # the runner's watcher holds the session ``running`` directly.
+    # here. It only existed to paper over older hook-model blind spots. The
+    # bare session busy state is now owned by ``UserPromptSubmit`` /
+    # ``Stop`` / ``StopFailure`` hooks; this path is only for the id-bearing
+    # streaming lifecycle below.
     #
     # Turn-start edge: the first time we see a turn's response id, publish a
-    # ``running`` status carrying it. The PTY watcher already drives the
-    # running/idle BADGE with a bare (id-less) status; this id-bearing edge is
-    # what lets ap-web open a *streaming* ``activeResponse`` for the turn, so
-    # the forwarded tool-call cards (which carry the same response id) render
-    # LIVE — spinner + elapsed timer — instead of as static completed cards.
+    # ``running`` status carrying it. The ``UserPromptSubmit`` hook already
+    # drives the bare busy badge; this id-bearing edge lets ap-web open a
+    # *streaming* ``activeResponse`` for the turn, so the forwarded tool-call
+    # cards (which carry the same response id) render LIVE — spinner + elapsed
+    # timer — instead of as static completed cards.
     # Deduped on the persistent ``dedupe`` baseline (NOT ``state``): when an
     # assistant item is held across polls for delta ordering, this function
     # early-returns with ``state`` unadvanced, so a ``state``-based guard would

@@ -2429,7 +2429,7 @@ async function bindStream(
         sessionStatus: session.status,
         // Re-show "N background tasks still running" after a reload/navigate-back: the
         // live SSE edge that set this is long gone, so the count rides in on
-        // the snapshot (server keeps it sticky past the trailing PTY `idle`).
+        // the snapshot (server keeps it sticky until a structured clear).
         backgroundTaskCount: session.backgroundTaskCount ?? 0,
         selectedEffort: effectiveEffort,
         selectedModel: effectiveModel,
@@ -4018,19 +4018,14 @@ export function handleSessionEvent(event: StreamEvent): void {
           return {};
         }
         const patch: Partial<ChatState> = { sessionStatus: event.status };
-        // The background-shell tally is STICKY. Only the Stop-hook-derived
-        // status carries an authoritative count (the forwarder relabels its
-        // `idle` to `waiting` and attaches `background_task_count`); the
-        // PTY-activity watcher's running/idle edges carry none (`undefined`).
-        // A claude-native turn that ends with shells still running emits, in
-        // order: the Stop hook's `waiting`(+count), then — ~1s later, once the
-        // pane quiesces — a bare PTY-activity `idle` (no count). If that
-        // trailing `idle` reset the count the spinner would vanish a beat
-        // after it appeared. So: an explicit count is authoritative (a Stop
-        // hook's `0` clears it, so a finished shell drops the indicator on the
-        // next turn end; a positive count sets it); `undefined` leaves it
-        // untouched; and a new turn (`running`) or a failure clears it —
-        // mirroring the server's `_publish_status`.
+        // The background-shell tally is STICKY. Only a structured turn-end
+        // status carries an authoritative count (Claude Stop relabels `idle`
+        // to `waiting` and attaches `background_task_count`). Bare
+        // running/idle edges from native sources carry no count (`undefined`),
+        // so they must not wipe a positive tally. An explicit count is
+        // authoritative (a Stop hook's `0` clears it; a positive count sets
+        // it); `undefined` leaves it untouched; and a new turn (`running`) or
+        // a failure clears it — mirroring the server's `_publish_status`.
         if (event.backgroundTaskCount !== undefined) {
           patch.backgroundTaskCount = event.backgroundTaskCount;
         } else if (event.status === "running" || event.status === "failed") {

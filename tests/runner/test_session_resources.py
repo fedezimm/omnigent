@@ -30,10 +30,11 @@ from omnigent.inner.terminal import TerminalInstance
 from omnigent.runner import create_runner_app
 from omnigent.runner import resource_registry as resource_registry_mod
 from omnigent.runner.resource_registry import (
-    _CLAUDE_NATIVE_STATUS_IDLE_THRESHOLD_SECONDS,
-    _CLAUDE_NATIVE_STATUS_POLL_INTERVAL_SECONDS,
+    _NATIVE_STATUS_IDLE_THRESHOLD_SECONDS,
+    _NATIVE_STATUS_POLL_INTERVAL_SECONDS,
     _TERMINAL_ACTIVITY_EMIT_MIN_INTERVAL_SECONDS,
     CLAUDE_NATIVE_TERMINAL_ROLE,
+    PI_NATIVE_TERMINAL_ROLE,
     SessionResourceRegistry,
 )
 from omnigent.spec.types import AgentSpec, ExecutorSpec
@@ -1604,20 +1605,18 @@ def _claude_terminal_spec(tmp_path: Path) -> TerminalEnvSpec:
 
 
 @pytest.mark.asyncio
-async def test_claude_native_terminal_drives_session_status_from_pane_activity(
+async def test_pi_native_terminal_drives_session_status_from_pane_activity(
     tmp_path: Path,
 ) -> None:
-    """The claude-native agent terminal's pane edges drive session status.
+    """Pane-status-owned native terminals still drive session status.
 
-    Launching with ``CLAUDE_NATIVE_TERMINAL_ROLE`` must wire the idle
-    edge (with the short claude-native status threshold) and translate
-    pane activity → ``running`` / quiescence → ``idle``, deduped to the
-    transition so a continuously-redrawing pane doesn't spam ``running``.
-    This is the PTY-activity-derived status that replaces the hook-based
-    ``UserPromptSubmit``/``Stop`` bracketing.
+    Launching a native role that still lacks structured lifecycle hooks must
+    wire the idle edge and translate pane activity → ``running`` / quiescence
+    → ``idle``, deduped to the transition so a continuously redrawing pane
+    doesn't spam ``running``.
     """
     capture = _WatcherCapture()
-    instance = _make_capturing_instance(tmp_path, capture, name="claude", session_key="main")
+    instance = _make_capturing_instance(tmp_path, capture, name="pi", session_key="main")
     registry = SessionResourceRegistry(terminal_registry=_LaunchReturningRegistry(instance))
     status_edges: list[_StatusEdge] = []
     registry.set_terminal_activity_publisher(lambda _sid, _tid: None)
@@ -1627,21 +1626,19 @@ async def test_claude_native_terminal_drives_session_status_from_pane_activity(
 
     await registry.launch_required_terminal(
         session_id="conv_x",
-        terminal_name="claude",
+        terminal_name="pi",
         session_key="main",
         spec=_claude_terminal_spec(tmp_path),
-        resource_role=CLAUDE_NATIVE_TERMINAL_ROLE,
+        resource_role=PI_NATIVE_TERMINAL_ROLE,
     )
 
-    # The agent terminal wires the idle edge with the short status
-    # threshold and the fast (200ms) poll interval; absence here would mean
-    # status never flips to idle (the regression the hook-based path
-    # suffered on interrupts) or transitions lag at the 1s default.
+    # Pane-status-owned native terminals wire the idle edge with the short
+    # native threshold and fast poll interval.
     assert capture.started is True
     assert capture.on_idle is not None
     assert capture.on_activity is not None
-    assert capture.idle_threshold_s == _CLAUDE_NATIVE_STATUS_IDLE_THRESHOLD_SECONDS
-    assert capture.poll_interval_s == _CLAUDE_NATIVE_STATUS_POLL_INTERVAL_SECONDS
+    assert capture.idle_threshold_s == _NATIVE_STATUS_IDLE_THRESHOLD_SECONDS
+    assert capture.poll_interval_s == _NATIVE_STATUS_POLL_INTERVAL_SECONDS
 
     # Two pane changes in one working stretch must yield exactly one
     # ``running`` edge — the dedupe holds. A second ``running`` here would
@@ -1665,6 +1662,47 @@ async def test_claude_native_terminal_drives_session_status_from_pane_activity(
     assert [e.status for e in status_edges] == ["running", "idle", "running"]
     # Every edge was published for the launching session, never a stray id.
     assert all(e.session_id == "conv_x" for e in status_edges)
+
+
+@pytest.mark.asyncio
+async def test_claude_native_terminal_activity_does_not_drive_session_status(
+    tmp_path: Path,
+) -> None:
+    """Claude native pane activity emits terminal pulses, not busy status.
+
+    Claude's ``UserPromptSubmit`` / ``Stop`` / ``StopFailure`` hooks own the
+    session busy state. The tmux watcher remains useful for the terminal-active
+    badge and required-terminal exits, but pane changes and quiescence must not
+    publish ``session.status``.
+    """
+    capture = _WatcherCapture()
+    instance = _make_capturing_instance(tmp_path, capture, name="claude", session_key="main")
+    registry = SessionResourceRegistry(terminal_registry=_LaunchReturningRegistry(instance))
+    status_edges: list[_StatusEdge] = []
+    activity_pulses: list[str] = []
+    registry.set_terminal_activity_publisher(lambda _sid, tid: activity_pulses.append(tid))
+    registry.set_session_status_publisher(
+        lambda sid, status: status_edges.append(_StatusEdge(session_id=sid, status=status))
+    )
+
+    await registry.launch_required_terminal(
+        session_id="conv_claude",
+        terminal_name="claude",
+        session_key="main",
+        spec=_claude_terminal_spec(tmp_path),
+        resource_role=CLAUDE_NATIVE_TERMINAL_ROLE,
+    )
+
+    assert capture.started is True
+    assert capture.on_activity is not None
+    assert capture.on_idle is None
+    assert capture.idle_threshold_s is None
+    assert capture.poll_interval_s is None
+
+    capture.on_activity()
+    await asyncio.sleep(0)
+    assert activity_pulses == ["terminal_claude_main"]
+    assert status_edges == []
 
 
 @pytest.mark.asyncio
@@ -1720,15 +1758,12 @@ async def test_terminal_activity_pulses_throttled_to_one_per_second(
 ) -> None:
     """Activity emission is throttled to one pulse per second per terminal.
 
-    The claude-native pane watcher polls every 200ms and Claude redraws
-    its busy line on nearly every poll, so ``_on_activity`` fires ~5x/sec
-    while a turn runs. Without throttling that would push ~5
-    ``session.terminal.activity`` events/second; the watcher must coalesce
-    them to at most one per
-    :data:`_TERMINAL_ACTIVITY_EMIT_MIN_INTERVAL_SECONDS`. A fresh idle
-    edge resets the throttle so the next working episode pulses
-    immediately rather than lagging up to a second behind the
-    running-status edge.
+    Pane-status-owned native watchers can poll faster than the default shell
+    watcher, so ``_on_activity`` may fire several times per second while a turn
+    runs. The watcher must coalesce those into at most one
+    ``session.terminal.activity`` per
+    :data:`_TERMINAL_ACTIVITY_EMIT_MIN_INTERVAL_SECONDS`. A fresh idle edge
+    resets the throttle so the next working episode pulses immediately.
 
     A fake monotonic clock makes the throttle window deterministic — the
     real watcher's 200ms poll spacing is replaced by hand-advanced time so
@@ -1744,20 +1779,20 @@ async def test_terminal_activity_pulses_throttled_to_one_per_second(
     monkeypatch.setattr(resource_registry_mod, "_monotonic", lambda: clock["now"])
 
     capture = _WatcherCapture()
-    instance = _make_capturing_instance(tmp_path, capture, name="claude", session_key="main")
+    instance = _make_capturing_instance(tmp_path, capture, name="pi", session_key="main")
     registry = SessionResourceRegistry(terminal_registry=_LaunchReturningRegistry(instance))
     activity_pulses: list[str] = []
     registry.set_terminal_activity_publisher(lambda _sid, tid: activity_pulses.append(tid))
-    # The idle-reset behaviour is only wired for the claude-native role, so
+    # The idle-reset behaviour is only wired for pane-status-owned roles, so
     # the status publisher must be installed to exercise on_idle.
     registry.set_session_status_publisher(lambda _sid, _status: None)
 
     await registry.launch_required_terminal(
         session_id="conv_throttle",
-        terminal_name="claude",
+        terminal_name="pi",
         session_key="main",
         spec=_claude_terminal_spec(tmp_path),
-        resource_role=CLAUDE_NATIVE_TERMINAL_ROLE,
+        resource_role=PI_NATIVE_TERMINAL_ROLE,
     )
     assert capture.on_activity is not None
     assert capture.on_idle is not None
@@ -1809,7 +1844,7 @@ async def test_terminal_activity_pulses_throttled_to_one_per_second(
         f"activity throttle, so a new episode lags behind the status edge."
     )
     # Every pulse carried this terminal's resource id, never a stray one.
-    assert set(activity_pulses) == {"terminal_claude_main"}
+    assert set(activity_pulses) == {"terminal_pi_main"}
 
 
 @pytest.mark.asyncio

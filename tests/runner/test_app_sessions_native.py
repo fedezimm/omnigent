@@ -4237,9 +4237,8 @@ async def test_create_session_preserves_existing_event_queue() -> None:
     queue, orphaning the relay on the now-dead object: ``_publish_event``
     then enqueued onto the new queue while the relay's generator blocked
     forever on the old one, so later events never reached the server. For
-    claude-native that dropped the PTY-watcher ``idle`` edge (emitted
-    asynchronously after the turn), stranding the session's web status at
-    "working". Init must PRESERVE an existing queue — assert the
+    claude-native that dropped forwarded lifecycle status, stranding the
+    session's web status at "working". Init must PRESERVE an existing queue — assert the
     pre-attached queue object survives init unchanged.
     """
     from omnigent.runner.app import _session_event_queues_ref
@@ -8800,18 +8799,15 @@ async def test_events_interrupt_on_native_session_injects_escape_without_marker(
     )
 
     # 3) The interrupt handler must NOT synthesize session.status: idle.
-    # Idle on interrupt now comes from the terminal's PTY activity watcher
-    # (it sees the pane quiesce after the Escape) — the single source of
-    # truth, which also keeps the session ``running`` if the interrupt
-    # didn't take. Synthesizing idle here would bypass the watcher's
-    # running/idle dedupe and could strand the UI on idle. This guards
-    # against re-adding the pre-PTY synthesized idle.
+    # Claude's hook forwarder owns completion/failure. If the interrupt
+    # succeeds, Claude should emit Stop; if it does not, keeping the session
+    # non-idle is more accurate than lying to the UI.
     status_idle = [
         e for e in queued_events if e.get("type") == "session.status" and e.get("status") == "idle"
     ]
     assert status_idle == [], (
         f"The native interrupt handler must not enqueue session.status: idle "
-        f"(the PTY watcher emits it on quiesce); got {status_idle!r} on the "
+        f"(the hook forwarder owns completion); got {status_idle!r} on the "
         f"queue: {queued_events!r}."
     )
 
@@ -8819,9 +8815,8 @@ async def test_events_interrupt_on_native_session_injects_escape_without_marker(
 @pytest.mark.parametrize(
     ("harness", "expected_statuses"),
     [
-        # claude-native's working status is owned by the PTY-activity
-        # watcher, so the runner injection task must not publish its
-        # own running/idle edges.
+        # claude-native's working status is owned by Claude hook events, so the
+        # runner injection task must not publish its own running/idle edges.
         ("claude-native", []),
         # codex-native may use the runner's running edge so the thread
         # shows work as soon as Omnigent accepts the turn, but must not use the
@@ -8874,7 +8869,7 @@ async def test_message_turn_lifecycle_status_suppressed_for_terminal_backed_harn
         # executor.type="omnigent" + config.harness=<harness> is the
         # canonical shape the runner reads at session start to populate
         # _session_spec_cache; _session_harness_name reads it back to
-        # decide whether a PTY watcher owns this session's status.
+        # decide whether an external native source owns this session's status.
         executor=ExecutorSpec(type="omnigent", config={"harness": harness}),
     )
     stream_finished = asyncio.Event()
@@ -8942,7 +8937,7 @@ async def test_message_turn_lifecycle_status_suppressed_for_terminal_backed_harn
     assert statuses == expected_statuses, (
         f"harness={harness}: expected runner turn lifecycle statuses "
         f"{expected_statuses!r}, got {statuses!r}. Claude-native must rely "
-        f"fully on the PTY watcher, Codex-native must keep only the runner "
+        f"fully on Claude hooks, Codex-native must keep only the runner "
         f"running edge, and non-terminal harnesses must keep the full runner "
         f"lifecycle source."
     )

@@ -11,8 +11,8 @@ Code's input box mounts several seconds later, and Claude flushes any
 pending terminal input when its TUI initializes. So a first message
 typed into that gap is silently dropped — the UI shows "Working…"
 forever and nothing is persisted. ``inject_user_message`` now waits for
-Claude's input prompt to render before typing (see
-``omnigent.claude_native_bridge._wait_for_claude_prompt_ready``).
+Claude's parent ``SessionStart`` hook before typing, which is the structured
+startup signal that the interactive session and transcript are available.
 
 Making the race deterministic
 -----------------------------
@@ -27,7 +27,7 @@ wrapper (first on ``PATH``) that:
    exec'ing the real ``claude`` — faithfully modeling Claude Code's
    own boot-time input flush, which is what discards early keystrokes.
 
-With the wrapper, a pre-prompt inject is reliably lost: **gate absent →
+With the wrapper, a pre-session-start inject is reliably lost: **gate absent →
 this test fails (marker never answered); gate present → it passes.**
 Verified red→green by toggling the gate.
 

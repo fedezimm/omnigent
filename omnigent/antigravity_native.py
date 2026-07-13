@@ -1470,9 +1470,9 @@ async def _launch_antigravity_terminal(
         #
         # Deliberately NOT ``bridge_inject_dir``: on the runner, that marker
         # triggers Claude-native machinery — it starts the Claude comment relay,
-        # tags the terminal ``CLAUDE_NATIVE_TERMINAL_ROLE`` (which drives the
-        # session's PTY-derived working status), and publishes Claude tmux
-        # metadata. None of that is owned by antigravity teardown, and
+        # tags the terminal ``CLAUDE_NATIVE_TERMINAL_ROLE`` for Claude activity
+        # / exit tracking, and publishes Claude tmux metadata. None of that is
+        # owned by antigravity teardown, and
         # antigravity derives its working status from the RPC reader's
         # ``external_session_status`` edges, not PTY activity.
         # ``ensure_native_terminal`` is allowlisted the same

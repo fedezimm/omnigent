@@ -12,10 +12,12 @@ This reaps a single native pane only when it is genuinely unused. "Busy" is the
 disjunction of three signals (any one spares the pane):
 
   * an in-flight runner turn (``has_active_turn``), OR
-  * the pane's PTY watcher currently reports ``running`` — i.e. the vendor CLI is
-    working autonomously *between* runner turns (native turns clear the runner's
-    ``_active_turns`` right after the prompt is pasted, so this is the load-bearing
-    signal for a long autonomous turn), OR
+  * the latest ``session.status`` is ``running`` / ``waiting`` — i.e. the vendor
+    CLI is working autonomously *between* runner turns (native turns clear the
+    runner's ``_active_turns`` right after the prompt is pasted, so this is the
+    load-bearing signal for a long autonomous turn; for Claude native the signal
+    comes from hooks, while some other native harnesses still use pane activity),
+    OR
   * a tmux client is attached (a human is watching the pane).
 
 A pane idle on all three for longer than the window is reaped, with a **second

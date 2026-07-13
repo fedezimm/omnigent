@@ -16,8 +16,8 @@ from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpe
 from omnigent.inner.os_env import EditEntry, OpResult, OSEnvironment
 from omnigent.inner.terminal import TerminalInstance
 from omnigent.runner.resource_registry import (
-    CLAUDE_NATIVE_TERMINAL_ROLE,
     CODEX_NATIVE_TERMINAL_ROLE,
+    PI_NATIVE_TERMINAL_ROLE,
     SessionResourceRegistry,
     TerminalExitEvent,
     TerminalLifecycle,
@@ -391,7 +391,7 @@ async def _observe_native_agent_terminal_and_capture(
         instance.name,  # type: ignore[attr-defined]
         instance.session_key,  # type: ignore[attr-defined]
         instance,
-        resource_role=CLAUDE_NATIVE_TERMINAL_ROLE,
+        resource_role=PI_NATIVE_TERMINAL_ROLE,
     )
     return callbacks
 
@@ -400,7 +400,7 @@ async def _observe_native_agent_terminal_and_capture(
 async def test_required_terminal_exit_while_idle_is_clean_shutdown(tmp_path: Path) -> None:
     """A required terminal that exits after going idle is not a failure.
 
-    The native agent terminal is long-lived: it goes ``idle`` when its turn
+    A pane-status native agent terminal is long-lived: it goes ``idle`` when its turn
     finishes. A pane exit observed while idle means the work was already
     delivered and the process simply shut down, so the exit event must carry
     ``session_was_idle=True`` — the runner uses that to avoid flipping the chat

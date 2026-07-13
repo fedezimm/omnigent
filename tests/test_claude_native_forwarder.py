@@ -1396,18 +1396,15 @@ async def test_forwarder_posts_web_injected_terminal_transcript_items(tmp_path: 
 
 
 @pytest.mark.asyncio
-async def test_forwarder_posts_idle_on_stop_and_ignores_user_prompt_submit(
+async def test_forwarder_posts_running_on_user_prompt_submit_and_idle_on_stop(
     tmp_path: Path,
 ) -> None:
     """
-    ``Stop`` → idle (the authoritative turn-end); ``UserPromptSubmit`` ignored.
+    ``UserPromptSubmit`` → running and ``Stop`` → idle.
 
-    ``Stop`` is the fire-once turn-end edge that drives sub-agent terminal
-    delivery (via ``external_session_status``, the codex-shared path). The
-    ``running`` edge stays PTY-derived, so ``UserPromptSubmit`` must NOT post a
-    status. We record ``UserPromptSubmit`` ahead of ``Stop``: the first (and
-    only) ``external_session_status`` POST must be the ``idle`` from ``Stop``.
-    A ``running`` arriving first would mean ``UserPromptSubmit`` still maps.
+    Claude's lifecycle hooks are the busy-state source for claude-native. The
+    prompt hook opens the bare session busy state; the Stop hook closes it and
+    carries the authoritative background-shell count.
     """
     bridge_dir = tmp_path / "bridge"
     transcript_path = tmp_path / "session.jsonl"
@@ -1441,7 +1438,8 @@ async def test_forwarder_posts_idle_on_stop_and_ignores_user_prompt_submit(
         )
     )
     try:
-        request = await _get_recorded_request(server)
+        running = await _get_recorded_request(server)
+        idle = await _get_recorded_request(server)
     finally:
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -1450,12 +1448,15 @@ async def test_forwarder_posts_idle_on_stop_and_ignores_user_prompt_submit(
         server.server_close()
         thread.join(timeout=5.0)
 
-    # The first (and only) status POST is the Stop → idle. A ``running``
-    # arriving first would mean UserPromptSubmit is still wrongly mapped.
-    assert request["path"] == "/v1/sessions/conv_abc/events"
+    assert running["path"] == "/v1/sessions/conv_abc/events"
+    assert running["body"] == {
+        "type": "external_session_status",
+        "data": {"status": "running"},
+    }
+    assert idle["path"] == "/v1/sessions/conv_abc/events"
     # The Stop hook carries its authoritative background-shell count (0 here,
     # no background tasks) so a finished shell clears the indicator.
-    assert request["body"] == {
+    assert idle["body"] == {
         "type": "external_session_status",
         "data": {"status": "idle", "background_task_count": 0},
     }
@@ -1474,9 +1475,8 @@ async def test_forwarder_ignores_subagent_stop_failure_hook(
     failed — the parent is still running while it awaits the Agent tool
     result. Subagent transcripts live under a ``subagents/`` directory,
     which the forwarder uses to distinguish them from parent events.
-    (Running/idle are no longer hook-derived; ``StopFailure`` →
-    ``failed`` is the only mapped status left, so this is the surviving
-    subagent-skip case.)
+    All lifecycle hooks are skipped for subagents so parent status is not
+    polluted by child turn edges.
     """
     bridge_dir = tmp_path / "bridge"
     transcript_path = tmp_path / "session.jsonl"
@@ -1776,8 +1776,8 @@ async def test_forwarder_does_not_post_compaction_on_non_compact_session_start(
     are processed in order, a spurious compaction POST would land BEFORE
     the ``StopFailure`` → failed POST, so asserting the first POST is the
     failed status proves the startup SessionStart emitted nothing.
-    (``StopFailure`` is used as the anchor because ``Stop`` no longer
-    posts a status — idle now comes from PTY pane activity.)
+    (``StopFailure`` is used as the anchor because a failed status is easy to
+    distinguish from compaction output.)
     """
     bridge_dir = tmp_path / "bridge"
     transcript_path = tmp_path / "session.jsonl"
@@ -1882,8 +1882,8 @@ async def test_forwarder_uses_auth_to_refresh_token_per_request(tmp_path: Path) 
     # Two assistant transcript items → two external_conversation_item
     # POSTs, which is all this test needs: distinct bearers on two
     # outbound requests. We use transcript items rather than hook status
-    # because running/idle are no longer hook-derived (only
-    # StopFailure→failed remains, a single edge).
+    # because this test only needs transcript item POSTs. A StopFailure hook
+    # would add an unrelated status edge.
     transcript_path.write_text(
         "\n".join(
             [
@@ -2688,8 +2688,8 @@ async def test_forwarder_migrates_hook_cursor_state_to_byte_offset(tmp_path: Pat
     Hook state migration must be per-record: a skipped ``SessionStart``
     and a posted ``StopFailure`` should advance the durable byte offset
     so the next poll does not rescan or repost either record.
-    (``StopFailure`` is the posted-status anchor because ``Stop`` no
-    longer maps to a status — idle now comes from PTY pane activity.)
+    (``StopFailure`` is the posted-status anchor because it produces one
+    status edge with no background-task count.)
     """
     bridge_dir = tmp_path / "bridge"
     transcript_path = tmp_path / "session.jsonl"
@@ -3280,9 +3280,8 @@ async def test_forwarder_mirrors_external_session_id_at_most_once(
         + "\n",
         encoding="utf-8",
     )
-    # ``StopFailure`` (not ``Stop``) so the hook still produces one status
-    # POST — ``Stop`` no longer maps to a status (idle comes from PTY pane
-    # activity). Its ``session_id`` is what the mirror PATCH latches onto;
+    # ``StopFailure`` produces one status POST without a background-task
+    # count. Its ``session_id`` is what the mirror PATCH latches onto;
     # the failed status is the third POST the loop-pump below consumes.
     record_hook_event(
         bridge_dir,
@@ -6765,9 +6764,15 @@ async def test_forward_status_events_stamps_response_id_on_idle(tmp_path: Path) 
     A ``Stop`` → idle edge carries the turn's ``response_id`` when one is known.
 
     This is what closes the streaming ``activeResponse`` ap-web opened from the
-    turn-start ``running`` edge, so the trailing tool card stops spinning.
+    id-bearing assistant-output ``running`` edge, so the trailing tool card
+    stops spinning. The preceding ``UserPromptSubmit`` running edge must remain
+    id-less; it opens only the session-level busy state.
     """
     bridge_dir = tmp_path / "bridge"
+    record_hook_event(
+        bridge_dir,
+        {"hook_event_name": "UserPromptSubmit", "session_id": "claude-session"},
+    )
     record_hook_event(
         bridge_dir,
         {"hook_event_name": "Stop", "session_id": "claude-session"},
@@ -6798,6 +6803,10 @@ async def test_forward_status_events_stamps_response_id_on_idle(tmp_path: Path) 
     assert bodies == [
         {
             "type": "external_session_status",
+            "data": {"status": "running"},
+        },
+        {
+            "type": "external_session_status",
             # The Stop→idle edge carries the turn's response id AND the
             # background-shell tally (0 here — no shells); the live-tool-card
             # and background-task features share this one status edge.
@@ -6806,7 +6815,7 @@ async def test_forward_status_events_stamps_response_id_on_idle(tmp_path: Path) 
                 "background_task_count": 0,
                 "response_id": "resp_turn_1",
             },
-        }
+        },
     ]
 
 
@@ -6815,10 +6824,11 @@ async def test_forwarder_emits_turn_start_running_with_response_id(tmp_path: Pat
     """
     The first assistant output of a turn publishes ``running`` + its response id.
 
-    Native Claude's running/idle BADGE stays PTY-derived; this id-bearing
-    ``running`` edge is the additional signal that lets ap-web open a streaming
-    ``activeResponse`` for the turn, so the forwarded tool cards (which share
-    the same response id) render LIVE rather than as static completed cards.
+    The hook-derived ``UserPromptSubmit`` edge drives the bare busy badge; this
+    id-bearing ``running`` edge is the additional signal that lets ap-web open a
+    streaming ``activeResponse`` for the turn, so the forwarded tool cards
+    (which share the same response id) render LIVE rather than as static
+    completed cards.
     The running edge's response id must equal the forwarded items' response id.
     """
     bridge_dir = tmp_path / "bridge"

@@ -22,7 +22,6 @@ import pytest
 
 from omnigent import claude_native_bridge, native_cost_popup
 from omnigent.claude_native_bridge import (
-    _claude_prompt_rendered,
     _hook_record_from_jsonl_record,
     _JsonlRecord,
     augment_claude_args,
@@ -35,6 +34,7 @@ from omnigent.claude_native_bridge import (
     post_tools_changed,
     prepare_bridge_dir,
     read_assistant_text_since,
+    read_claude_input_state,
     read_hook_events_from_offset,
     read_launch_model,
     read_message_deltas_from_offset,
@@ -73,12 +73,27 @@ def subprocess_bridge_root() -> Iterator[Path]:
         ``python -m omnigent.claude_native_bridge`` accepts bridge
         writes without inheriting pytest monkeypatches.
     """
-    production_root = Path("/tmp") / f"omnigent-{os.getuid()}" / "claude-native"
+    production_root = (
+        Path(tempfile.gettempdir())
+        / f"omnigent-{claude_native_bridge.stable_user_id()}"
+        / "claude-native"
+    )
     production_root.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(production_root.parent, 0o700)
     os.chmod(production_root, 0o700)
     with tempfile.TemporaryDirectory(prefix="bridge-test-", dir=production_root) as raw:
         yield Path(raw)
+
+
+def _subprocess_trusted_parent(subprocess_bridge_root: Path) -> Path:
+    """
+    Return the trusted parent used by a child bridge process.
+
+    :param subprocess_bridge_root: Test root under
+        ``$TMPDIR/omnigent-<uid>/claude-native``.
+    :returns: The child process's default ``tempfile.gettempdir()`` root.
+    """
+    return subprocess_bridge_root.parents[2]
 
 
 class _NoPrefixReadFile:
@@ -2307,7 +2322,10 @@ def test_mcp_server_initialize_omits_blocked_channel_capability(
     Code would refuse to start with that capability advertised under
     org policy, breaking the native wrapper.
     """
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", Path("/tmp"))
+    monkeypatch.setattr(
+        "omnigent.claude_native_bridge._TRUSTED_PARENT",
+        _subprocess_trusted_parent(subprocess_bridge_root),
+    )
     monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", subprocess_bridge_root)
     bridge_dir = prepare_bridge_dir("conv_abc", workspace=tmp_path)
     proc = subprocess.Popen(
@@ -2382,6 +2400,77 @@ def test_write_tmux_target_persists_socket_and_target(tmp_path: Path) -> None:
     assert payload["tmux_target"] == "claude:0.0"
     assert payload["pid"] == 12345
     assert before <= payload["updated_at"] <= after
+    input_state = read_claude_input_state(bridge_dir)
+    assert input_state.state == "waiting_for_session_start"
+    assert input_state.details["tmux_target"] == "claude:0.0"
+    assert input_state.details["pid"] == 12345
+
+
+def test_parent_hooks_update_claude_input_state(tmp_path: Path) -> None:
+    """
+    Parent Claude hooks move the bridge input state; subagent hooks do not.
+    """
+    bridge_dir = tmp_path / "bridge"
+    parent_transcript = tmp_path / "session.jsonl"
+    subagent_transcript = tmp_path / "subagents" / "agent-abc.jsonl"
+
+    assert read_claude_input_state(bridge_dir).state == "not_advertised"
+
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "parent-session",
+            "transcript_path": str(parent_transcript),
+        },
+    )
+    input_state = read_claude_input_state(bridge_dir)
+    assert input_state.state == "session_started"
+    assert input_state.details["claude_session_id"] == "parent-session"
+
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "Stop",
+            "session_id": "subagent-session",
+            "transcript_path": str(subagent_transcript),
+        },
+    )
+    assert read_claude_input_state(bridge_dir).state == "session_started"
+
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "parent-session",
+            "transcript_path": str(parent_transcript),
+            "prompt_id": "prompt-1",
+            "prompt": "hello",
+        },
+    )
+    input_state = read_claude_input_state(bridge_dir)
+    assert input_state.state == "turn_running"
+    assert input_state.details["prompt_id"] == "prompt-1"
+
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "Stop",
+            "session_id": "parent-session",
+            "transcript_path": str(parent_transcript),
+        },
+    )
+    assert read_claude_input_state(bridge_dir).state == "ready_after_stop"
+
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "StopFailure",
+            "session_id": "parent-session",
+            "transcript_path": str(parent_transcript),
+        },
+    )
+    assert read_claude_input_state(bridge_dir).state == "failed"
 
 
 @pytest.mark.parametrize(
@@ -2431,47 +2520,50 @@ def test_inject_user_message_pastes_content_then_submits(
         socket_path=Path("/tmp/example/tmux.sock"),
         tmux_target="claude:0.0",
     )
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "claude-session",
+            "transcript_path": str(tmp_path / "session.jsonl"),
+        },
+    )
 
     captured: list[list[str]] = []
     loaded_payloads: list[bytes] = []
-    # Simulates Claude Code's input-box state machine: empty before the
-    # paste, draft (collapsed-paste placeholder) after the paste, empty
-    # again once Enter submits. The paste-committed and submit-verified
-    # gates both poll capture-pane, so a static pane would either stall
-    # the paste gate (draft never appears) or fail verification.
-    tui = {"pane": "❯ "}
 
     def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
         """
-        Record tmux calls; simulate the TUI's input-box state.
+        Record tmux calls and emit Claude's submit hook on Enter.
 
-        ``capture-pane`` calls (the readiness / paste-committed /
-        submit-verified polls) return the current simulated pane and
-        are not recorded — the assertions below count only the
-        delivery invocations. ``load-buffer`` calls read the temp
-        file's bytes at call time (the harness unlinks it after the
-        paste, so asserting later would race the cleanup).
-        ``paste-buffer`` puts the draft into the simulated input box;
-        ``Enter`` clears it (submit).
+        ``load-buffer`` calls read the temp file's bytes at call time
+        (the harness unlinks it after the paste, so asserting later
+        would race the cleanup). ``Enter`` appends the structured
+        ``UserPromptSubmit`` acknowledgement that the bridge now waits for.
 
         :param cmd: Argv list passed to subprocess.run.
         :param kwargs: Subprocess kwargs (capture_output, text, etc.).
         :returns: A fake CompletedProcess with rc=0.
         """
         del kwargs
-        if "capture-pane" in cmd:
-            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
         if "load-buffer" in cmd:
             loaded_payloads.append(Path(cmd[-1]).read_bytes())
-        if "paste-buffer" in cmd:
-            tui["pane"] = "❯ [Pasted text #1 +2 lines]"
         if cmd[-1] == "Enter":
-            tui["pane"] = "❯ "
+            record_hook_event(
+                bridge_dir,
+                {
+                    "hook_event_name": "UserPromptSubmit",
+                    "session_id": "claude-session",
+                    "transcript_path": str(tmp_path / "session.jsonl"),
+                    "prompt_id": "prompt-1",
+                    "prompt": content,
+                },
+            )
         captured.append(cmd)
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr("subprocess.run", _fake_run)
-    inject_user_message(bridge_dir, content=content)
+    ack = inject_user_message(bridge_dir, content=content)
 
     # C-a, C-k (clear), load-buffer, paste-buffer, Enter — fewer than 5
     # means a delivery step was dropped.
@@ -2516,6 +2608,13 @@ def test_inject_user_message_pastes_content_then_submits(
         "claude:0.0",
         "Enter",
     ]
+    assert ack.prompt_id == "prompt-1"
+    assert ack.ack_source == "hook"
+    assert not ack.queued
+    input_state = read_claude_input_state(bridge_dir)
+    assert input_state.state == "accepted"
+    assert input_state.details["ack_source"] == "hook"
+    assert input_state.details["prompt_id"] == "prompt-1"
 
 
 def test_inject_user_message_raises_when_tmux_target_never_published(
@@ -2531,6 +2630,9 @@ def test_inject_user_message_raises_when_tmux_target_never_published(
     """
     with pytest.raises(RuntimeError, match="tmux target is not advertised"):
         inject_user_message(tmp_path / "bridge", content="hi", timeout_s=0.0)
+    input_state = read_claude_input_state(tmp_path / "bridge")
+    assert input_state.state == "failed"
+    assert input_state.details["phase"] == "waiting_for_tmux"
 
 
 def test_inject_user_message_raises_on_tmux_failure(
@@ -2550,24 +2652,27 @@ def test_inject_user_message_raises_on_tmux_failure(
         socket_path=Path("/tmp/example/tmux.sock"),
         tmux_target="claude:0.0",
     )
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "claude-session",
+            "transcript_path": str(tmp_path / "session.jsonl"),
+        },
+    )
 
     def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
         """
-        Pass the readiness gate, then fail the send-keys call.
+        Fail the first tmux delivery command.
 
-        ``capture-pane`` returns a ready pane (rc=0) so the test
-        exercises the send-keys failure path specifically, not the
-        readiness timeout. All other tmux calls return rc=1 to
-        simulate a dead tmux server.
+        The test pre-records ``SessionStart`` so it exercises the
+        tmux failure path specifically, not the readiness timeout.
 
         :param cmd: Argv list passed to subprocess.run.
         :param kwargs: Subprocess kwargs (ignored).
-        :returns: A fake CompletedProcess (rc=0 for capture-pane,
-            rc=1 otherwise).
+        :returns: A fake non-zero CompletedProcess.
         """
         del kwargs
-        if "capture-pane" in cmd:
-            return SimpleNamespace(returncode=0, stdout="❯ ", stderr="")
         return SimpleNamespace(
             returncode=1,
             stdout="",
@@ -2579,177 +2684,261 @@ def test_inject_user_message_raises_on_tmux_failure(
         inject_user_message(bridge_dir, content="hi")
 
 
-def test_inject_user_message_waits_for_claude_prompt_before_typing(
+def test_inject_user_message_waits_for_session_start_before_typing(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    Injection polls for Claude's prompt before sending any keystrokes.
+    Injection waits for Claude's structured SessionStart before typing.
 
     On a freshly-created session ``tmux.json`` is advertised before
-    Claude Code's input box mounts. If we typed immediately the first
-    message would be dropped into the still-booting TUI. This pins that
-    no send-keys is issued until ``capture-pane`` shows the prompt
-    glyph, and that injection proceeds once it does.
+    Claude Code is ready. If we typed immediately the first message
+    could be dropped into the still-booting TUI. This pins that no
+    tmux command is issued until the parent ``SessionStart`` hook is
+    recorded.
     """
     monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.claude_native_bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01)
     bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
     write_tmux_target(
         bridge_dir,
         socket_path=Path("/tmp/example/tmux.sock"),
         tmux_target="claude:0.0",
     )
 
-    send_keys: list[list[str]] = []
-    # Prompt is absent for the first two polls (TUI still booting),
-    # then renders. A wrong gate would send keys during the empty
-    # polls; a correct gate waits for the third capture. After boot the
-    # fake behaves like the live input box: the paste deposits the
-    # draft, Enter clears it (so the submit-verification gate passes).
-    boot_panes = ["", "", "❯ "]
-    capture_calls = {"n": 0}
-    tui = {"pane": "❯ "}
+    captured: list[list[str]] = []
+
+    def _emit_session_start() -> None:
+        time.sleep(0.05)
+        record_hook_event(
+            bridge_dir,
+            {
+                "hook_event_name": "SessionStart",
+                "session_id": "claude-session",
+                "transcript_path": str(transcript_path),
+            },
+        )
+
+    thread = threading.Thread(target=_emit_session_start)
+    thread.start()
 
     def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
         """
-        Serve a not-ready-then-ready pane; record send-keys calls.
+        Record tmux calls after the structured readiness gate opens.
 
         :param cmd: Argv list passed to subprocess.run.
         :param kwargs: Subprocess kwargs (ignored).
-        :returns: Fake CompletedProcess; capture-pane returns the next
-            boot pane until the prompt renders, then the simulated
-            input-box state; send-keys returns rc=0.
+        :returns: Fake CompletedProcess with rc=0.
         """
         del kwargs
-        if "capture-pane" in cmd:
-            idx = min(capture_calls["n"], len(boot_panes) - 1)
-            capture_calls["n"] += 1
-            # No keystrokes may have been sent before the prompt shows.
-            if boot_panes[idx] == "":
-                assert send_keys == [], "typed before Claude prompt rendered"
-                return SimpleNamespace(returncode=0, stdout="", stderr="")
-            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
-        if "paste-buffer" in cmd:
-            tui["pane"] = "❯ hello"
+        assert claude_native_bridge.read_claude_session_id(bridge_dir) == "claude-session"
         if cmd[-1] == "Enter":
-            tui["pane"] = "❯ "
-        send_keys.append(cmd)
+            record_hook_event(
+                bridge_dir,
+                {
+                    "hook_event_name": "UserPromptSubmit",
+                    "session_id": "claude-session",
+                    "transcript_path": str(transcript_path),
+                    "prompt_id": "prompt-1",
+                    "prompt": "hello",
+                },
+            )
+        captured.append(cmd)
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr("subprocess.run", _fake_run)
-    inject_user_message(bridge_dir, content="hello")
+    try:
+        inject_user_message(bridge_dir, content="hello", timeout_s=1.0)
+    finally:
+        thread.join(timeout=1.0)
 
-    # Gate polled until the third capture (prompt present), then the
-    # five delivery calls (C-a, C-k, load-buffer, paste-buffer, Enter)
-    # fired.
-    assert capture_calls["n"] >= 3, (
-        f"Expected >=3 capture-pane polls before the prompt rendered, got {capture_calls['n']}."
+    assert len(captured) == 5, (
+        f"Expected 5 tmux calls (C-a, C-k, load-buffer, paste-buffer, Enter), got {len(captured)}."
     )
-    assert len(send_keys) == 5, (
-        f"Expected 5 tmux calls (C-a, C-k, load-buffer, paste-buffer, Enter), "
-        f"got {len(send_keys)}."
-    )
-    clear_home, clear_kill, load, paste, submit = send_keys
+    clear_home, clear_kill, load, paste, submit = captured
     assert clear_home[-1] == "C-a"
     assert clear_kill[-1] == "C-k"
-    # The paste fires after the gate via the buffer path. The exact
-    # payload/flag assertions live in the dedicated paste test; here the
-    # gate ordering is the claim.
     assert load[3] == "load-buffer"
     assert paste[3] == "paste-buffer"
     assert submit[-1] == "Enter"
 
 
-def test_inject_user_message_raises_when_prompt_never_renders(
+def test_inject_user_message_ignores_subagent_state_for_readiness(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    Injection fails loud if Claude's prompt never renders (boot failed).
+    A subagent transcript in bridge state is not parent-session readiness.
+
+    Claude subagent hooks carry their own transcript path. If that path
+    is the most recent bridge state, injection must still wait for a
+    parent ``SessionStart`` instead of typing into the terminal early.
+    """
+    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.claude_native_bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01)
+    bridge_dir = tmp_path / "bridge"
+    parent_transcript_path = tmp_path / "session.jsonl"
+    subagent_transcript_path = tmp_path / "subagents" / "agent-abc.jsonl"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "Stop",
+            "session_id": "subagent-session",
+            "transcript_path": str(subagent_transcript_path),
+        },
+    )
+
+    captured: list[list[str]] = []
+
+    def _emit_parent_session_start() -> None:
+        time.sleep(0.05)
+        record_hook_event(
+            bridge_dir,
+            {
+                "hook_event_name": "SessionStart",
+                "session_id": "parent-session",
+                "transcript_path": str(parent_transcript_path),
+            },
+        )
+
+    thread = threading.Thread(target=_emit_parent_session_start)
+    thread.start()
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """
+        Record tmux calls only after parent readiness is observed.
+
+        :param cmd: Argv list passed to subprocess.run.
+        :param kwargs: Subprocess kwargs (ignored).
+        :returns: Fake CompletedProcess with rc=0.
+        """
+        del kwargs
+        assert claude_native_bridge.read_claude_session_id(bridge_dir) == "parent-session"
+        if cmd[-1] == "Enter":
+            record_hook_event(
+                bridge_dir,
+                {
+                    "hook_event_name": "UserPromptSubmit",
+                    "session_id": "parent-session",
+                    "transcript_path": str(parent_transcript_path),
+                    "prompt_id": "prompt-1",
+                    "prompt": "hello",
+                },
+            )
+        captured.append(cmd)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    try:
+        inject_user_message(bridge_dir, content="hello", timeout_s=1.0)
+    finally:
+        thread.join(timeout=1.0)
+
+    assert captured[-1][-1] == "Enter"
+
+
+def test_inject_user_message_raises_when_session_start_never_arrives(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Injection fails loud if Claude never reports SessionStart.
 
     Without this the turn would complete with the message dropped and
     the web UI stuck on "Working…". The RuntimeError surfaces as an
-    ExecutorError instead. No keystrokes must be sent on this path.
+    ExecutorError instead. No tmux delivery command must be sent on
+    this path.
     """
     monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.claude_native_bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01)
     bridge_dir = tmp_path / "bridge"
     write_tmux_target(
         bridge_dir,
         socket_path=Path("/tmp/example/tmux.sock"),
         tmux_target="claude:0.0",
     )
-    send_keys: list[list[str]] = []
+    captured: list[list[str]] = []
 
     def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
-        """
-        Always report an empty (never-ready) pane.
-
-        :param cmd: Argv list passed to subprocess.run.
-        :param kwargs: Subprocess kwargs (ignored).
-        :returns: Fake CompletedProcess; capture-pane returns "".
-        """
+        """Record unexpected tmux invocations."""
         del kwargs
         if "capture-pane" in cmd:
-            return SimpleNamespace(returncode=0, stdout="", stderr="")
-        send_keys.append(cmd)
+            return SimpleNamespace(returncode=0, stdout="Do you want to continue?", stderr="")
+        captured.append(cmd)
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr("subprocess.run", _fake_run)
-    with pytest.raises(RuntimeError, match="did not become ready"):
+    with pytest.raises(RuntimeError, match="SessionStart"):
         inject_user_message(bridge_dir, content="hi", timeout_s=0.3)
-    assert send_keys == [], "no keystrokes should be sent when the prompt never renders"
+    assert captured == [], "no tmux delivery commands should be sent before SessionStart"
+    input_state = read_claude_input_state(bridge_dir)
+    assert input_state.state == "attention_required"
+    assert input_state.details["phase"] == "waiting_for_session_start"
+    assert "Do you want to continue?" in input_state.details["terminal_tail"]
 
 
-def test_inject_user_message_ignores_prompt_glyph_in_scrollback(
+def test_inject_user_message_does_not_capture_pane_on_success(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    The readiness gate only trusts the prompt glyph in the pane tail.
+    Successful delivery does not inspect screen glyphs.
 
-    Claude echoes prior user input (which may contain ``❯``) into
-    scrollback. If the gate matched anywhere in the pane it would
-    falsely pass while the live input box is still booting. Here ``❯``
-    appears only in an early line, with later non-empty lines lacking
-    it, so the gate must NOT treat the pane as ready.
+    The bridge should rely on hooks/transcript for readiness and ack.
+    ``capture-pane`` remains available only for diagnostics after a
+    failed delivery.
     """
     monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
     bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
     write_tmux_target(
         bridge_dir,
         socket_path=Path("/tmp/example/tmux.sock"),
         tmux_target="claude:0.0",
     )
-    # `❯` only on an early line; the last several non-empty lines (the
-    # tail the gate scans) do not contain it.
-    scrollback = "\n".join(
-        [
-            "❯ old prompt echo",
-            "output line 1",
-            "output line 2",
-            "output line 3",
-            "output line 4",
-            "output line 5",
-        ]
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "claude-session",
+            "transcript_path": str(transcript_path),
+        },
     )
 
     def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
         """
-        Return a pane with the glyph only in scrollback.
+        Fail if screen capture is used, otherwise emit submit ack.
 
         :param cmd: Argv list passed to subprocess.run.
         :param kwargs: Subprocess kwargs (ignored).
-        :returns: Fake CompletedProcess; capture-pane returns the
-            scrollback pane.
+        :returns: Fake CompletedProcess with rc=0.
         """
         del kwargs
         if "capture-pane" in cmd:
-            return SimpleNamespace(returncode=0, stdout=scrollback, stderr="")
+            raise AssertionError("inject_user_message must not capture the pane on success")
+        if cmd[-1] == "Enter":
+            record_hook_event(
+                bridge_dir,
+                {
+                    "hook_event_name": "UserPromptSubmit",
+                    "session_id": "claude-session",
+                    "transcript_path": str(transcript_path),
+                    "prompt_id": "prompt-1",
+                    "prompt": "hi",
+                },
+            )
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr("subprocess.run", _fake_run)
-    with pytest.raises(RuntimeError, match="did not become ready"):
-        inject_user_message(bridge_dir, content="hi", timeout_s=0.3)
+    ack = inject_user_message(bridge_dir, content="hi")
+
+    assert ack.ack_source == "hook"
 
 
 def test_inject_user_message_resends_enter_when_first_submit_swallowed(
@@ -2757,118 +2946,250 @@ def test_inject_user_message_resends_enter_when_first_submit_swallowed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    A submit Enter swallowed by the TUI's paste burst is retried.
+    A submit Enter with no structured acknowledgement is retried once.
 
     Claude Code coalesces rapid stdin bursts into a paste; an Enter
     that lands inside that window becomes a newline in the draft
-    instead of a submit, and the message sits unsent — the "typed but
-    never sent" bug. The helper must observe (via capture-pane) that
-    the draft is still in the input box after Enter and re-send Enter
-    until it clears. Here the fake TUI swallows the first Enter
-    (draft stays put) and submits on the second; a regression to
-    fire-and-forget Enter would send exactly one and return "success"
-    with the message undelivered.
+    instead of a submit, and the message sits unsent. The bridge now
+    detects that by absence of ``UserPromptSubmit``/transcript ack and
+    sends one delayed Enter retry.
     """
     monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
-    # Shrink the polling cadence so the retry happens in milliseconds —
-    # the production defaults (1s retry spacing) would make this test slow.
     monkeypatch.setattr("omnigent.claude_native_bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01)
-    monkeypatch.setattr("omnigent.claude_native_bridge._SUBMIT_RETRY_INTERVAL_S", 0.02)
+    monkeypatch.setattr("omnigent.claude_native_bridge._DELIVERY_ENTER_RETRY_AFTER_S", 0.02)
+    monkeypatch.setattr("omnigent.claude_native_bridge._DELIVERY_ACK_TIMEOUT_S", 0.3)
     monkeypatch.setattr("omnigent.claude_native_bridge._PASTE_SETTLE_S", 0.0)
     bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
     write_tmux_target(
         bridge_dir,
         socket_path=Path("/tmp/example/tmux.sock"),
         tmux_target="claude:0.0",
     )
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "claude-session",
+            "transcript_path": str(transcript_path),
+        },
+    )
 
     enters: list[list[str]] = []
-    # Input-box state machine: the paste deposits the draft; the FIRST
-    # Enter is swallowed (folded into the paste burst — draft stays);
-    # the second Enter submits and clears the box.
-    tui = {"pane": "❯ ", "swallowed_enters": 0}
+    swallowed = {"done": False}
 
     def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
         """
-        Simulate a TUI that swallows the first submit Enter.
+        Simulate a TUI that only acknowledges the second Enter.
 
         :param cmd: Argv list passed to subprocess.run.
         :param kwargs: Subprocess kwargs (ignored).
-        :returns: Fake CompletedProcess; capture-pane returns the
-            simulated input-box pane, other calls return rc=0.
+        :returns: Fake CompletedProcess with rc=0.
         """
         del kwargs
-        if "capture-pane" in cmd:
-            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
-        if "paste-buffer" in cmd:
-            tui["pane"] = "❯ fix the flaky test"
         if cmd[-1] == "Enter":
             enters.append(cmd)
-            if tui["swallowed_enters"] == 0:
-                tui["swallowed_enters"] = 1  # folded into the paste — draft stays
+            if not swallowed["done"]:
+                swallowed["done"] = True
             else:
-                tui["pane"] = "❯ "  # submitted — input box clears
+                record_hook_event(
+                    bridge_dir,
+                    {
+                        "hook_event_name": "UserPromptSubmit",
+                        "session_id": "claude-session",
+                        "transcript_path": str(transcript_path),
+                        "prompt_id": "prompt-1",
+                        "prompt": "fix the flaky test",
+                    },
+                )
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr("subprocess.run", _fake_run)
-    inject_user_message(bridge_dir, content="fix the flaky test")
+    ack = inject_user_message(bridge_dir, content="fix the flaky test")
 
-    # Exactly two Enters: the swallowed one plus one retry. One means
-    # the verify-retry loop regressed to fire-and-forget (the bug);
-    # three+ means retries keep firing after the draft cleared.
     assert len(enters) == 2, (
         f"Expected the swallowed Enter to be retried exactly once, got {len(enters)} Enter(s)."
     )
+    assert ack.prompt_id == "prompt-1"
 
 
-def test_inject_user_message_raises_when_draft_never_submits(
+def test_inject_user_message_accepts_busy_queue_transcript_ack(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    Injection fails loud when the draft never leaves the input box.
+    A busy Claude turn can acknowledge delivery with ``queue-operation``.
 
-    If every submit Enter is swallowed (e.g. the pane is wedged in a
-    dialog), returning success would complete the Omnigent turn with
-    the message still sitting unsent in Claude's input box. The
-    RuntimeError surfaces as an ExecutorError instead.
+    When text is sent while Claude is still working, Claude records the
+    queued prompt in the transcript immediately and delays
+    ``UserPromptSubmit`` until the previous turn stops. The bridge must
+    treat that transcript row as successful queued delivery.
     """
     monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr("omnigent.claude_native_bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01)
-    monkeypatch.setattr("omnigent.claude_native_bridge._SUBMIT_RETRY_INTERVAL_S", 0.02)
-    monkeypatch.setattr("omnigent.claude_native_bridge._SUBMIT_VERIFY_TIMEOUT_S", 0.2)
     monkeypatch.setattr("omnigent.claude_native_bridge._PASTE_SETTLE_S", 0.0)
     bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
     write_tmux_target(
         bridge_dir,
         socket_path=Path("/tmp/example/tmux.sock"),
         tmux_target="claude:0.0",
     )
-
-    tui = {"pane": "❯ "}
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "claude-session",
+            "transcript_path": str(transcript_path),
+        },
+    )
 
     def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
-        """
-        Simulate a TUI where the draft never submits.
-
-        The paste deposits the draft and every Enter is ignored, so
-        the input box never clears.
-
-        :param cmd: Argv list passed to subprocess.run.
-        :param kwargs: Subprocess kwargs (ignored).
-        :returns: Fake CompletedProcess; capture-pane returns the
-            simulated input-box pane, other calls return rc=0.
-        """
+        """Append the queued transcript row when Enter is sent."""
         del kwargs
-        if "capture-pane" in cmd:
-            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
-        if "paste-buffer" in cmd:
-            tui["pane"] = "❯ fix the flaky test"
+        if cmd[-1] == "Enter":
+            with transcript_path.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    json.dumps(
+                        {
+                            "type": "queue-operation",
+                            "operation": "enqueue",
+                            "content": "steer me",
+                            "sessionId": "claude-session",
+                        }
+                    )
+                    + "\n"
+                )
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr("subprocess.run", _fake_run)
-    with pytest.raises(RuntimeError, match="message was not delivered"):
+    ack = inject_user_message(bridge_dir, content="steer me")
+
+    assert ack.ack_source == "transcript_queue"
+    assert ack.queued
+    assert ack.prompt_id is None
+    input_state = read_claude_input_state(bridge_dir)
+    assert input_state.state == "queued"
+    assert input_state.details["ack_source"] == "transcript_queue"
+    assert input_state.details["queued"] is True
+
+
+def test_inject_user_message_accepts_transcript_user_ack_without_hook(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Transcript user rows are a fallback delivery acknowledgement.
+
+    Hooks are the preferred ack source, but Claude also records accepted
+    prompts in the transcript. If the hook forwarder misses a
+    ``UserPromptSubmit`` line, the exact transcript user row still proves
+    delivery.
+    """
+    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.claude_native_bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01)
+    monkeypatch.setattr("omnigent.claude_native_bridge._PASTE_SETTLE_S", 0.0)
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "claude-session",
+            "transcript_path": str(transcript_path),
+        },
+    )
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """Append the user transcript row when Enter is sent."""
+        del kwargs
+        if cmd[-1] == "Enter":
+            with transcript_path.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    json.dumps(
+                        {
+                            "type": "user",
+                            "promptId": "prompt-from-transcript",
+                            "sessionId": "claude-session",
+                            "promptSource": "typed",
+                            "message": {"role": "user", "content": "hello"},
+                        }
+                    )
+                    + "\n"
+                )
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    ack = inject_user_message(bridge_dir, content="hello")
+
+    assert ack.ack_source == "transcript_user"
+    assert ack.prompt_id == "prompt-from-transcript"
+    assert not ack.queued
+
+
+def test_inject_user_message_raises_when_prompt_never_acknowledged(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Injection fails loud when Claude never acknowledges the prompt.
+
+    If both the first Enter and the retry fail to produce a hook or
+    transcript record, returning success would complete the Omnigent
+    turn with no proof that Claude received the message.
+    """
+    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.claude_native_bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01)
+    monkeypatch.setattr("omnigent.claude_native_bridge._DELIVERY_ENTER_RETRY_AFTER_S", 0.02)
+    monkeypatch.setattr("omnigent.claude_native_bridge._DELIVERY_ACK_TIMEOUT_S", 0.08)
+    monkeypatch.setattr("omnigent.claude_native_bridge._PASTE_SETTLE_S", 0.0)
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "claude-session",
+            "transcript_path": str(transcript_path),
+        },
+    )
+    enters: list[list[str]] = []
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """
+        Ignore submit Enters and return pane text for failure diagnostics.
+
+        :param cmd: Argv list passed to subprocess.run.
+        :param kwargs: Subprocess kwargs (ignored).
+        :returns: Fake CompletedProcess with rc=0.
+        """
+        del kwargs
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout="❯ fix the flaky test", stderr="")
+        if cmd[-1] == "Enter":
+            enters.append(cmd)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    with pytest.raises(RuntimeError, match="did not acknowledge"):
         inject_user_message(bridge_dir, content="fix the flaky test")
+    assert len(enters) == 2
+    input_state = read_claude_input_state(bridge_dir)
+    assert input_state.state == "attention_required"
+    assert input_state.details["phase"] == "awaiting_ack"
+    assert "fix the flaky test" in input_state.details["terminal_tail"]
 
 
 def test_inject_interrupt_sends_escape_keystroke(
@@ -3233,7 +3554,10 @@ async def test_channel_server_relays_active_omnigent_tools(
     This fails if Claude Code can receive web-channel inputs but cannot
     call the Omnigent tools made available to the server-side agent.
     """
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", Path("/tmp"))
+    monkeypatch.setattr(
+        "omnigent.claude_native_bridge._TRUSTED_PARENT",
+        _subprocess_trusted_parent(subprocess_bridge_root),
+    )
     monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", subprocess_bridge_root)
     bridge_dir = prepare_bridge_dir("conv_tools", workspace=tmp_path)
     proc = subprocess.Popen(
@@ -3440,7 +3764,10 @@ async def test_serve_mcp_survives_handler_exception_and_keeps_serving(
     ``-32000: Connection closed``). Without the guard, the decode error kills
     ``_serve_mcp`` and the ``tools/list`` read below times out.
     """
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", Path("/tmp"))
+    monkeypatch.setattr(
+        "omnigent.claude_native_bridge._TRUSTED_PARENT",
+        _subprocess_trusted_parent(subprocess_bridge_root),
+    )
     monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", subprocess_bridge_root)
     bridge_dir = prepare_bridge_dir("conv_crash", workspace=tmp_path)
 
@@ -3761,7 +4088,10 @@ async def test_relay_close_keeps_advertisement_owned_by_newer_relay(
     and leave it in place. Unconditional unlinking here would erase the
     still-active newer session's ``list_comments`` / ``update_comment``.
     """
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", Path("/tmp"))
+    monkeypatch.setattr(
+        "omnigent.claude_native_bridge._TRUSTED_PARENT",
+        _subprocess_trusted_parent(subprocess_bridge_root),
+    )
     monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", subprocess_bridge_root)
     bridge_dir = prepare_bridge_dir("conv_shared_bridge", workspace=tmp_path)
     relay_file = bridge_dir / claude_native_bridge._TOOL_RELAY_FILE
@@ -4892,166 +5222,6 @@ def test_display_cost_approval_popup_raises_when_pane_not_advertised(
         )
 
 
-def test_claude_prompt_rendered_sees_prompt_above_default_footer() -> None:
-    """
-    The readiness scan reaches the prompt glyph above Claude's footer.
-
-    Claude Code 2.1.x renders a footer below the input box (the box's
-    closing rule line, the cwd/status line, the model+effort line, and
-    the permission-mode hint), so the live ``❯`` row is the 5th
-    non-empty line from the bottom — NOT the last. The prior 4-line scan
-    window never reached it and the web-UI readiness gate timed out with
-    "did not become ready" even though the box was mounted. A failure
-    here means the scan window regressed below 5 and the first web
-    message would be dropped.
-    """
-    pane = "\n".join(
-        [
-            "────────────────────────────────────────",  # input box top rule
-            "❯ ",  # the live prompt row (5th non-empty line from bottom)
-            "────────────────────────────────────────",  # box closing rule
-            "  alice: /home/alice/proj   Remote Control failed",  # status line
-            "  Opus 4.8 (1M context) | effort:high",  # model + effort line
-            "  ⏵⏵ don't ask on (shift+tab to cycle) · ← for agents",  # hint line
-        ]
-    )
-    # ``❯`` is 5 non-empty lines above the bottom (rule + status + model
-    # + hint sit below it), so only a scan window of >= 5 reaches it.
-    assert _claude_prompt_rendered(pane) is True
-
-
-def test_claude_prompt_rendered_sees_prompt_above_running_turn_footer() -> None:
-    """
-    The readiness scan reaches the prompt above a tall running-turn footer.
-
-    When a web-UI message is injected while Claude is mid-turn, the footer
-    grows extra status rows below the input box — a running-subagent line
-    (``○ Explore …``) on top of the usual box rule, model, auto-mode, and
-    branch rows. That pushes the live ``❯`` row to the 6th non-empty line
-    from the bottom, one past the old 5-line window, so the readiness gate
-    timed out and the web UI rendered a spurious "did not become ready"
-    runtime-error card even though the terminal was healthy.
-    """
-    pane = "\n".join(
-        [
-            "────────────────────────────────────────",  # input box top rule
-            "❯ ",  # the live prompt row (6th non-empty line from bottom)
-            "────────────────────────────────────────",  # box closing rule
-            "  Opus 4.8 (1M context) | thinking medium",  # model + effort line
-            "  ⏵⏵ auto mode on (shift+tab to cycle)",  # permission-mode hint
-            "  main",  # branch label
-            "  ○ Explore  Find session sidebar state… 1m 4s",  # subagent status
-        ]
-    )
-    assert _claude_prompt_rendered(pane) is True
-
-
-def test_claude_prompt_rendered_sees_prompt_above_subagent_fanout_footer() -> None:
-    """
-    The readiness scan reaches the prompt above an unbounded subagent footer.
-
-    A subagent fan-out renders one ``○ Explore …`` row per concurrent
-    subagent, so the running-turn footer height is unbounded. Here five
-    subagents plus the model/auto-mode/branch rows push the live ``❯`` row
-    to the 12th non-empty line from the bottom — far past any fixed scan
-    window. The box rule below ``❯`` (the input box's closing frame) is
-    what admits it, so the scan must reach the glyph at this depth and the
-    web UI must NOT render a spurious "did not become ready" card.
-    """
-    pane = "\n".join(
-        [
-            "────────────────────────────────────────",  # input box top rule
-            "❯ Press up to edit queued messages",  # the live prompt row
-            "────────────────────────────────────────",  # box closing rule
-            "  Opus 4.8 (1M context) | thinking medium | 398.1k/1M (39%)",
-            "  ⏵⏵ auto mode on (shift+tab to cycle)",
-            "  main",
-            "  ○ Explore  Angle A: line-by-line diff scan   1m 35s",
-            "  ○ Explore  Angle C: cross-file tracer         56s",
-            "  ○ Explore  Angle D: reuse                      46s",
-            "  ○ Explore  Angle F: efficiency                 31s",
-            "  ○ Explore  Angle G: altitude                   21s",
-        ]
-    )
-    assert _claude_prompt_rendered(pane) is True
-
-
-def test_claude_prompt_rendered_ignores_unframed_glyph_deep_in_tail() -> None:
-    """
-    A glyph in the wider window without a box rule below is not trusted.
-
-    The framed window that lets the scan reach a prompt under a tall
-    running-turn footer must not resurrect the scrollback false positive:
-    a ``❯`` echoed into prior output sits in the wider window too, but
-    without the input box's closing ``────`` rule beneath it. Only plain
-    output follows here, so the gate must still report "not ready".
-    """
-    pane = "\n".join(
-        [
-            "❯ old prompt echo",  # 6th non-empty line from bottom, no rule below
-            "output line 1",
-            "output line 2",
-            "output line 3",
-            "output line 4",
-            "output line 5",
-        ]
-    )
-    assert _claude_prompt_rendered(pane) is False
-
-
-def test_claude_prompt_rendered_ignores_custom_api_key_menu() -> None:
-    """The custom-API-key menu's selected row is not the chat input.
-
-    Claude Code's startup "Detected a custom API key" confirmation renders
-    its highlighted choice with the same ``❯`` glyph the chat composer uses
-    (``❯ 2. No (recommended)``). Treating it as ready pastes the first web
-    message into the menu, so no turn starts — the tmux delivery false
-    positive this guards against.
-    """
-    pane = "\n".join(
-        [
-            "Detected a custom API key in your environment",
-            "Do you want to use this API key?",
-            "  1. Yes",
-            "❯ 2. No (recommended)",  # selected menu row, NOT the chat input
-        ]
-    )
-    assert _claude_prompt_rendered(pane) is False
-
-
-def test_claude_prompt_rendered_sees_chat_input_below_menu_glyph() -> None:
-    """A real chat prompt still reads ready even past a menu-shaped echo.
-
-    A numbered ``❯`` choice echoed into scrollback must not suppress the
-    live input box below it: the chat ``❯`` row (no numbered choice after
-    the glyph) is the one that marks readiness.
-    """
-    pane = "\n".join(
-        [
-            "❯ 2. No (recommended)",  # scrollback echo of a prior menu row
-            "output",
-            "────────────────────────────────────────",  # input box top rule
-            "❯ ",  # the live chat prompt
-            "────────────────────────────────────────",  # box closing rule
-            "  Opus 4.8 (1M context) | effort:high",
-        ]
-    )
-    assert _claude_prompt_rendered(pane) is True
-
-
-def test_claude_prompt_rendered_sees_numbered_draft_in_framed_input() -> None:
-    """A numbered composer draft is distinguished from an unframed menu row."""
-    pane = "\n".join(
-        [
-            "────────────────────────────────────────",
-            "❯ 2. buy milk",
-            "────────────────────────────────────────",
-            "  Opus 4.8 (1M context) | effort:high",
-        ]
-    )
-    assert _claude_prompt_rendered(pane) is True
-
-
 def _write_deltas_lines(bridge_dir: Path, lines: list[str]) -> None:
     """
     Append raw JSONL lines to the bridge deltas file.
@@ -5403,120 +5573,6 @@ def test_format_terminal_failure_tail_caps_length(monkeypatch: pytest.MonkeyPatc
     assert body.startswith("…")
     # Leading ellipsis marker plus at most the configured character cap.
     assert len(body) <= 51
-
-
-def test_wait_for_claude_prompt_ready_surfaces_terminal_output_on_timeout(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """
-    On a readiness timeout, the RuntimeError carries Claude Code's own
-    terminal output (e.g. a startup ``JSON Parse error``) so the cause
-    surfaces in the web UI error banner, not only in the terminal.
-
-    Without the tail, the user sees a generic "terminal did not become
-    ready" timeout in the UI while the actual crash sits unread in the
-    terminal pane.
-
-    :param monkeypatch: Pytest monkeypatch fixture.
-    :returns: None.
-    """
-    crash_pane = (
-        "ERROR  JSON Parse error: Unrecognized token '<'\n"
-        "  at <parse> (:0)\n"
-        "  at parse (unknown)\n"
-    )
-    monkeypatch.setattr(
-        "omnigent.claude_native_bridge._capture_pane",
-        lambda socket_path, tmux_target: crash_pane,
-    )
-    with pytest.raises(RuntimeError) as excinfo:
-        claude_native_bridge._wait_for_claude_prompt_ready(
-            "/tmp/example/tmux.sock",
-            "claude:0.0",
-            timeout_s=0.0,
-        )
-    message = str(excinfo.value)
-    assert "did not become ready" in message
-    assert "Last terminal output:" in message
-    assert "JSON Parse error: Unrecognized token '<'" in message
-
-
-def test_wait_for_claude_prompt_ready_reports_empty_capture_count(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """
-    A timeout where every capture came back empty says so in the error.
-
-    An empty ``capture-pane`` (a torn read under a busy mid-turn repaint,
-    not a boot crash) leaves no tail to attach. Without the poll/empty
-    counts the error is indistinguishable from "Claude never rendered a
-    prompt", which is what sent triage down the wrong path. The counts make
-    the two failure modes tell themselves apart.
-
-    :param monkeypatch: Pytest monkeypatch fixture.
-    :returns: None.
-    """
-    monkeypatch.setattr(
-        "omnigent.claude_native_bridge._capture_pane",
-        lambda socket_path, tmux_target: "",
-    )
-    with pytest.raises(RuntimeError) as excinfo:
-        claude_native_bridge._wait_for_claude_prompt_ready(
-            "/tmp/example/tmux.sock",
-            "claude:0.0",
-            timeout_s=0.0,
-        )
-    message = str(excinfo.value)
-    assert "did not become ready" in message
-    # One poll happened (do-while), and it was empty.
-    assert "1 polls, 1 empty captures" in message
-    # No pane text to surface when every capture was empty.
-    assert "Last terminal output:" not in message
-
-
-def test_wait_for_claude_prompt_ready_tail_is_observed_not_recaptured(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """
-    The attached tail is a capture the loop saw, not a post-timeout one.
-
-    The bug this guards: attaching a fresh capture taken *after* the
-    deadline can show a healthier frame (e.g. the input box repainting as
-    the turn settles) than any decision the loop actually made, so the
-    error misrepresents why the gate failed. The tail must come from a
-    capture observed while the loop was still deciding. A box-less capture
-    followed by a box-present one that arrives only after the deadline
-    proves the point: the box-present frame must NOT leak into the error.
-
-    :param monkeypatch: Pytest monkeypatch fixture.
-    :returns: None.
-    """
-    observed = "  ✱ Working…\n  ⏵⏵ auto mode on (shift+tab to cycle)\n"
-    # A frame that would satisfy the readiness check, but only ever returned
-    # after the deadline has passed — mimicking the box repainting late.
-    late_ready = "────────────────\n❯ \n────────────────\n  Opus 4.8\n"
-    calls = {"n": 0}
-
-    def fake_capture(socket_path: str, tmux_target: str) -> str:
-        calls["n"] += 1
-        # First (and only, at timeout_s=0) in-loop capture: no box.
-        # Any later capture would be the box-present frame — which the
-        # rewritten gate must never fetch, since it does not re-capture.
-        return observed if calls["n"] == 1 else late_ready
-
-    monkeypatch.setattr("omnigent.claude_native_bridge._capture_pane", fake_capture)
-    with pytest.raises(RuntimeError) as excinfo:
-        claude_native_bridge._wait_for_claude_prompt_ready(
-            "/tmp/example/tmux.sock",
-            "claude:0.0",
-            timeout_s=0.0,
-        )
-    message = str(excinfo.value)
-    # The tail reflects what the loop observed, and the late box-present
-    # frame never appears — proving no post-deadline re-capture happened.
-    assert "auto mode on" in message
-    assert "❯" not in message
-    assert calls["n"] == 1
 
 
 # ── _hook_record_from_jsonl_record: background_task_count ────────────────────

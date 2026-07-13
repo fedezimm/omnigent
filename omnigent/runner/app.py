@@ -5805,8 +5805,9 @@ async def _auto_create_claude_terminal(
             session_key="main",
             spec=env_spec,
             parent_os_env=agent_os_env,
-            # Mark this as the claude-native agent terminal so its pane
-            # activity drives the session's PTY-derived working status.
+            # Mark this as the claude-native agent terminal so activity pulses
+            # and required-terminal exits are scoped to the agent pane. Claude
+            # busy state itself is structured-hook-derived.
             resource_role=CLAUDE_NATIVE_TERMINAL_ROLE,
         )
     except Exception:
@@ -7957,12 +7958,10 @@ def create_runner_app(
     # Turn sequencing (SESSION_REARCHITECTURE Step 5 / SESSION_STEERING_MIGRATION Step 1)
     _active_turns: dict[str, asyncio.Task[None] | None] = {}
     # Latest working status per session ("running"/"idle"/...), mirrored from
-    # every session.status edge at the _publish_event chokepoint (so it covers the
-    # PTY watcher's roles AND codex/antigravity/opencode, whose edges are published
-    # directly). The native-pane idle reaper (#1349) reads this as its "currently
-    # working" signal: native turns clear _active_turns right after the prompt is
-    # pasted, so for a long autonomous turn this status is the only reliable
-    # in-memory liveness signal.
+    # every session.status edge at the _publish_event chokepoint. The native-pane
+    # idle reaper (#1349) reads this as its "currently working" signal: native
+    # turns clear _active_turns right after the prompt is pasted, so for a long
+    # autonomous turn this status is the reliable in-memory liveness signal.
     _native_pane_status: dict[str, str] = {}
     _session_message_buffers: dict[str, list[dict[str, Any]]] = {}
     # Per-conversation message-ingest ordering (RUNNER_MESSAGE_INGEST.md
@@ -8057,12 +8056,9 @@ def create_runner_app(
         queue.put_nowait(event)
         # Mirror the latest session.status edge so the native-pane idle reaper
         # (#1349) can tell a pane working autonomously ("running") from an idle
-        # one. This is the single chokepoint every session.status publish flows
-        # through, so it covers BOTH the PTY watcher's roles (via
-        # _publish_session_status) AND codex/antigravity/opencode, whose
-        # running/idle edges are published here directly rather than by the PTY
-        # watcher. Recorded for every session (SDK too); the reaper only consults
-        # it for native panes.
+        # one. This single chokepoint covers pane-derived native roles,
+        # structured native forwarders, and runner-owned statuses. Recorded for
+        # every session (SDK too); the reaper only consults it for native panes.
         if event.get("type") == "session.status":
             _status_value = event.get("status")
             if isinstance(_status_value, str):
@@ -8290,10 +8286,10 @@ def create_runner_app(
     resource_registry.set_terminal_activity_publisher(_publish_terminal_activity)
 
     def _publish_session_status(session_id: str, status: str) -> None:
-        """Publish a PTY-activity-derived ``session.status`` edge.
+        """Publish a pane-activity-derived ``session.status`` edge.
 
-        Invoked on the event loop by the resource registry's claude-native
-        agent-terminal watcher when the pane crosses an activity/idle edge.
+        Invoked on the event loop by the resource registry for native roles
+        whose panes still own running/idle status.
         Emitting the same ``session.status`` shape the runner uses for its
         own turns lets the Omnigent server relay it through the normal status
         path (cache + SSE). The watcher already dedupes to edges, so this
@@ -10477,22 +10473,17 @@ def create_runner_app(
         terminal observer already owns that edge.
 
         Terminal-backed sessions do not all have the same safe edge source.
-        For claude-native, pi-native, and cursor-native, the PTY-activity
-        watcher owns ``running`` and ``idle`` because a runner turn only types
-        into the agent's own pane and ``run_turn`` returns the instant the
-        message is injected — the model turn then runs entirely in the TUI.
-        Publishing the turn-lifecycle ``idle`` here would race ahead of (and
-        clobber) the watcher's ``running``, dropping the web "Working…" spinner
-        the moment the message is sent. For codex-native AND antigravity-native,
-        the runner may publish ``running`` when it accepts
-        a web turn for dispatch, but the native observer owns
-        ``idle`` because the runner's injection task returns as soon as the agent
-        accepts the message, while the user-visible model turn may still be
-        active — for codex-native the Codex app-server forwarder owns ``idle``;
-        for antigravity-native the RPC read driver owns it (the executor's
-        ``SendUserCascadeMessage`` returns as soon as agy accepts the turn, so the
-        runner's ``idle`` would fire ~2s before agy's reasoning/output streams,
-        prematurely completing the response — the double-idle the live e2e found).
+        For claude-native, the structured Claude hook forwarder owns
+        ``running`` and ``idle`` because the runner turn only types into the
+        agent's pane and returns before the visible model turn completes. For
+        pi/cursor/kiro/goose/qwen/kimi/hermes, the pane watcher still owns those
+        edges because those integrations do not have a structured lifecycle
+        forwarder. Publishing the turn-lifecycle ``idle`` here would race ahead
+        of the real native turn completion and clear the web "Working…" spinner
+        too early. For codex-native and antigravity-native, the runner may
+        publish ``running`` when it accepts a web turn for dispatch, but the
+        native observer owns ``idle`` because the injection task returns before
+        the user-visible model turn finishes.
 
         ``failed`` always publishes: a turn-setup error is not observable
         from terminal activity and must surface regardless of harness.
@@ -10608,14 +10599,11 @@ def create_runner_app(
         only forged a ``role:"user"`` bubble the user never sent into the
         AP-side mirror, diverging it from Claude's real transcript.
 
-        Status is intentionally NOT synthesized here. The terminal's PTY
-        activity watcher is the single source of truth: it emits
-        ``session.status: idle`` once the pane quiesces after the Escape,
-        and keeps the session ``running`` if the interrupt didn't actually
-        stop Claude. Emitting ``idle`` here too (as this used to, back when
-        the hook-based status couldn't observe idle-on-Escape) would
-        bypass — and desync — the watcher's running/idle dedupe, and could
-        strand the UI on ``idle`` while Claude kept working.
+        Status is intentionally NOT synthesized here. The Claude hook
+        forwarder is the source of truth: a successful stop should produce a
+        ``Stop`` edge, a failure should produce ``StopFailure``, and a missing
+        hook leaves the session visibly non-idle instead of lying to the web UI
+        that Claude has stopped.
 
         :param conv_id: Session/conversation identifier,
             e.g. ``"conv_abc123"``.
@@ -10652,9 +10640,8 @@ def create_runner_app(
         # No ``_append_cancellation_items``: the synthetic marker is for
         # in-process LLM harnesses only (see docstring). The /events dispatch
         # already keeps native out of ``_interrupted_sessions``.
-        # NB: no synthesized ``session.status: idle`` here — the PTY watcher
-        # emits idle when the pane quiesces after the Escape (and re-asserts
-        # running if the interrupt didn't take). See the docstring.
+        # NB: no synthesized ``session.status: idle`` here — the Claude hook
+        # forwarder owns completion/failure. See the docstring.
         _wake_parent_after_native_interrupt(conv_id)
         return Response(status_code=204)
 
@@ -16287,10 +16274,10 @@ def create_runner_app(
                 cwd_override=cwd_override,
                 sandbox_override=sandbox_override,
                 parent_os_env=agent_os_env,
-                # The bridge-inject path is the ``omnigent claude``
-                # wrapper launching the claude-native agent terminal —
-                # mark it so its pane activity drives the session's
-                # PTY-derived working status.
+                # The bridge-inject path is the ``omnigent claude`` wrapper
+                # launching the claude-native agent terminal. Mark it so
+                # activity pulses and required-terminal exits are scoped to the
+                # agent pane; busy state comes from Claude hooks.
                 resource_role=(CLAUDE_NATIVE_TERMINAL_ROLE if bridge_inject else None),
             )
         except RuntimeError as exc:
