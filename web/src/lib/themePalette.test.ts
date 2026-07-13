@@ -51,9 +51,29 @@ describe("themePalette", () => {
   it("guards known vs unknown palette ids", () => {
     expect(isThemePalette("github")).toBe(true);
     expect(isThemePalette("omni")).toBe(true);
+    expect(isThemePalette("monokai")).toBe(true);
     expect(isThemePalette("nope")).toBe(false);
     expect(isThemePalette(undefined)).toBe(false);
     expect(isThemePalette(42)).toBe(false);
+  });
+
+  it("round-trips the monokai palette", () => {
+    writeThemePalette("monokai");
+    expect(readThemePalette()).toBe("monokai");
+    expect(localStorage.getItem(STORAGE_KEY)).toBe(JSON.stringify("monokai"));
+  });
+
+  it("applies monokai as data-theme on the document root", () => {
+    applyThemePalette("monokai");
+    expect(document.documentElement.getAttribute("data-theme")).toBe("monokai");
+  });
+
+  it("monokai swatch has expected dark palette colors", () => {
+    const palette = PALETTES.find((p) => p.id === "monokai");
+    expect(palette).toBeDefined();
+    expect(palette!.dark.bg).toBe("#272822");
+    expect(palette!.dark.text.toLowerCase()).toBe("#f8f8f2");
+    expect(palette!.dark.accent.toLowerCase()).toBe("#a6e22e");
   });
 
   it("sets data-theme on the document root for a non-default palette", () => {
