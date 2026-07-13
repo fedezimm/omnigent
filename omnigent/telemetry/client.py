@@ -49,6 +49,7 @@ import threading
 import time
 import uuid
 from dataclasses import asdict
+from pathlib import Path
 from typing import Any
 
 from omnigent.version import VERSION
@@ -82,26 +83,61 @@ _SCHEMA_VERSION = 1
 _TELEMETRY_SESSION_ID: str = str(uuid.uuid4())
 
 
+def _config_telemetry_disabled() -> bool:
+    """Return ``True`` when ``telemetry: false`` is set in config.yaml.
+
+    Reads ``~/.omnigent/config.yaml`` (honouring ``OMNIGENT_CONFIG_HOME``).
+    Returns ``False`` on any error so a missing/malformed config never
+    silently suppresses telemetry.
+    """
+    try:
+        import yaml
+
+        config_home = os.environ.get("OMNIGENT_CONFIG_HOME")
+        if config_home:
+            config_path = Path(config_home) / "config.yaml"
+        else:
+            config_path = Path.home() / ".omnigent" / "config.yaml"
+        if not config_path.exists():
+            return False
+        with open(config_path) as f:
+            cfg = yaml.safe_load(f) or {}
+        tel = cfg.get("telemetry")
+        # Support both `telemetry: false` and `telemetry:\n  enabled: false`
+        if isinstance(tel, bool):
+            return not tel
+        if isinstance(tel, dict):
+            enabled = tel.get("enabled")
+            if isinstance(enabled, bool):
+                return not enabled
+        return False
+    except Exception:
+        return False
+
+
 def is_disabled() -> bool:
     """Return ``True`` when telemetry should be completely suppressed.
 
     Checks (in order):
     1. ``OMNIGENT_TELEMETRY=0``
-    2. ``OMNIGENT_DISABLE_TELEMETRY=true`` (any truthy spelling)
+    2. ``DISABLE_TELEMETRY=true`` or ``OMNIGENT_DISABLE_TELEMETRY=true``
     3. ``DO_NOT_TRACK=1``
     4. Any CI environment variable from :data:`_CI_ENV_VARS`
+    5. ``telemetry: false`` in ``~/.omnigent/config.yaml``
 
     Always returns a ``bool``; never raises.
     """
     try:
         if os.environ.get("OMNIGENT_TELEMETRY", "").strip() == "0":
             return True
-        dnt_val = os.environ.get("OMNIGENT_DISABLE_TELEMETRY", "").strip().lower()
-        if dnt_val in ("1", "true", "yes"):
-            return True
+        for var in ("DISABLE_TELEMETRY", "OMNIGENT_DISABLE_TELEMETRY"):
+            if os.environ.get(var, "").strip().lower() in ("1", "true", "yes"):
+                return True
         if os.environ.get("DO_NOT_TRACK", "").strip() == "1":
             return True
-        return any(var in os.environ for var in _CI_ENV_VARS)
+        if any(var in os.environ for var in _CI_ENV_VARS):
+            return True
+        return _config_telemetry_disabled()
     except Exception:
         return True
 
