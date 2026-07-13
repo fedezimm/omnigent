@@ -12576,17 +12576,17 @@ async def _create_session_from_existing_agent(
         await asyncio.to_thread(conversation_store.set_labels, conv.id, body.labels)
 
     # Emit session.created exactly once at creation time.
-    # Best-effort: skip if the runner's host opted out via HelloFrame.
+    # Best-effort: skip if the host opted out via HostHelloFrame.
     try:
         import hashlib as _hashlib
 
-        _tr: TunnelRegistry | None = getattr(request.app.state, "tunnel_registry", None)
-        _runner_opted_out = (
-            _tr is not None
-            and conv.runner_id is not None
-            and _tr.is_runner_telemetry_opted_out(conv.runner_id)
+        _hr: HostRegistry | None = getattr(request.app.state, "host_registry", None)
+        _host_opted_out = (
+            _hr is not None
+            and conv.host_id is not None
+            and _hr.is_host_telemetry_opted_out(conv.host_id)
         )
-        if not _runner_opted_out:
+        if not _host_opted_out:
             _install_id = _get_installation_id()
             _anon_uid: str | None = None
             if user_id is not None:
