@@ -1837,6 +1837,13 @@ class HostProcess:
         :raises Exception: On WebSocket disconnect or error — propagated
             to the reconnect loop in :meth:`run`.
         """
+        _tel_opt_out = False
+        try:
+            from omnigent.telemetry.client import is_disabled as _tel_disabled
+
+            _tel_opt_out = _tel_disabled()
+        except Exception:  # noqa: BLE001 — telemetry errors must not abort hello
+            pass
         hello = HostHelloFrame(
             version=VERSION,
             frame_protocol_version=1,
@@ -1847,6 +1854,7 @@ class HostProcess:
             # the server's view refreshes whenever the tunnel does; the
             # launch-time check above stays the authoritative gate.
             configured_harnesses=await asyncio.to_thread(configured_harness_map),
+            telemetry_opt_out=_tel_opt_out,
         )
         await ws.send(encode_host_frame(hello))
         self._ws = ws

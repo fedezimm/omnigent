@@ -287,6 +287,12 @@ from omnigent.stores.conversation_store import (
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.host_store import Host, HostStore
 from omnigent.stores.permission_store import PermissionStore
+from omnigent.telemetry import emit as _tel_emit
+from omnigent.telemetry.events import SessionCreatedEvent as _TelSessionCreatedEvent
+from omnigent.telemetry.events import SessionDeletedEvent as _TelSessionDeletedEvent
+from omnigent.telemetry.events import SessionStoppedEvent as _TelSessionStoppedEvent
+from omnigent.telemetry.installation_id import get_installation_id as _get_installation_id
+from omnigent.telemetry.surface import classify_surface as _classify_surface
 from omnigent.tools.client_specified import parse_client_side_tool_specs
 
 _logger = logging.getLogger(__name__)
@@ -12584,6 +12590,39 @@ async def _create_session_from_existing_agent(
         conv = await asyncio.to_thread(conversation_store.get_conversation, conv.id)
     elif body.labels:
         await asyncio.to_thread(conversation_store.set_labels, conv.id, body.labels)
+
+    # Emit session.created exactly once at creation time.
+    # Best-effort: skip if the host opted out via HostHelloFrame.
+    try:
+        import hashlib as _hashlib
+
+        _hr: HostRegistry | None = getattr(request.app.state, "host_registry", None)
+        _host_opted_out = (
+            _hr is not None
+            and conv.host_id is not None
+            and _hr.is_host_telemetry_opted_out(conv.host_id)
+        )
+        if not _host_opted_out:
+            _install_id = _get_installation_id()
+            _anon_uid: str | None = None
+            if user_id is not None:
+                _salt = f"{_install_id}:{user_id}" if _install_id else user_id
+                _anon_uid = _hashlib.sha256(_salt.encode()).hexdigest()[:16]
+            _tel_emit(
+                _TelSessionCreatedEvent(
+                    session_id=conv.id,
+                    agent_id=agent.id,
+                    harness=native_agent.harness if native_agent is not None else None,
+                    surface=_classify_surface(request.headers.get("user-agent")),
+                    installation_id=_install_id,
+                    anon_user_id=_anon_uid,
+                    is_fork=body.parent_session_id is not None,
+                    is_sub_agent=body.sub_agent_name is not None,
+                )
+            )
+    except Exception:  # noqa: BLE001 — telemetry must not disrupt session creation
+        pass
+
     if body.initial_items:
         runner_client = await _get_runner_client(conv.id, runner_router)
         if runner_client is None:
@@ -19338,6 +19377,23 @@ def create_sessions_router(
             # honestly, and the next message auto-relaunches the session on
             # its (still-online) host via the normal message-dispatch
             # relaunch path below.
+            try:
+                import hashlib as _hashlib
+
+                _srv_id = _get_installation_id()
+                _anon: str | None = None
+                if user_id is not None:
+                    _salt = f"{_srv_id}:{user_id}" if _srv_id else user_id
+                    _anon = _hashlib.sha256(_salt.encode()).hexdigest()[:16]
+                _tel_emit(
+                    _TelSessionStoppedEvent(
+                        session_id=session_id,
+                        installation_id=_srv_id,
+                        anon_user_id=_anon,
+                    )
+                )
+            except Exception:  # noqa: BLE001 — telemetry is best-effort
+                pass
             return {"queued": False}
         if body.type == _APPROVAL_TYPE:
             # Deliver the verdict through the shared resolver: it
@@ -20374,6 +20430,32 @@ def create_sessions_router(
                     # still deletes the row and revokes the token.
                     getattr(request.app.state, "sandbox_config", None),
                 )
+        try:
+            import hashlib as _hashlib
+            import time as _time
+
+            _srv_id = _get_installation_id()
+            _anon_d: str | None = None
+            if user_id is not None:
+                _salt_d = f"{_srv_id}:{user_id}" if _srv_id else user_id
+                _anon_d = _hashlib.sha256(_salt_d.encode()).hexdigest()[:16]
+            _usage = conv.session_usage or {}
+            _duration: float | None = None
+            with contextlib.suppress(Exception):
+                _duration = _time.time() - conv.created_at
+            _tel_emit(
+                _TelSessionDeletedEvent(
+                    session_id=session_id,
+                    installation_id=_srv_id,
+                    anon_user_id=_anon_d,
+                    duration_seconds=_duration,
+                    input_tokens=_usage.get("input_tokens"),
+                    output_tokens=_usage.get("output_tokens"),
+                    total_cost_usd=_usage.get("total_cost_usd"),
+                )
+            )
+        except Exception:  # noqa: BLE001 — telemetry is best-effort
+            pass
         return ConversationDeleted(id=session_id)
 
     # ── Permission management endpoints ──────────────────────────
