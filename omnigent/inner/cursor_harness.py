@@ -17,8 +17,8 @@ route through the Databricks AI gateway.
 
 Env vars read at startup:
 
-- ``HARNESS_CURSOR_MODEL``: Cursor model id, e.g. ``"gpt-5"`` or ``"auto"``.
-  ``None`` resolves to cursor's ``auto`` select. A ``databricks-*`` id (from a
+- ``HARNESS_CURSOR_MODEL``: Cursor model id, e.g. ``"gpt-5"`` or ``"auto-smart"``.
+  ``None`` resolves to cursor's ``auto-smart`` select. A ``databricks-*`` id (from a
   spec authored for another harness) is dropped by the executor.
 - ``HARNESS_CURSOR_CWD``: working directory the session operates in.
   ``None`` falls back to ``os_env.cwd`` then the process cwd.

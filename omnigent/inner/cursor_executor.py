@@ -81,8 +81,10 @@ ToolExecutor: TypeAlias = Callable[[str, dict[str, Any]], Awaitable[Any]]  # typ
 
 # Cursor's auto model-select, used when a spec pins no cursor model (the SDK
 # requires a model for local agents, so unlike the old ACP path we can't pass
-# ``None``).
-_DEFAULT_CURSOR_MODEL = "auto"
+# ``None``). The SDK renamed the id from ``auto`` to ``auto-smart``; keep
+# mapping the legacy id for specs/env that still say ``auto``.
+_DEFAULT_CURSOR_MODEL = "auto-smart"
+_LEGACY_AUTO_MODEL = "auto"
 
 # Upper bound (seconds) on one bridged-tool call: generous (sub-agent dispatches
 # can run for minutes) but finite, so a wedged tool surfaces a timeout error
@@ -98,10 +100,11 @@ _HOOK_APPROVAL_TIMEOUT_S = 86400
 def _resolve_model(model: str | None) -> str:
     """Resolve the cursor model id, dropping ids cursor can't honor.
 
-    cursor-sdk accepts only Cursor model ids (``auto``, ``gpt-5``,
+    cursor-sdk accepts only Cursor model ids (``auto-smart``, ``gpt-5``,
     ``composer-2.5``, ...), so a gateway-routed model id (carried by a spec
     authored for another harness) falls back to cursor's auto-select. ``None``
-    likewise resolves to ``auto`` (the SDK requires a model).
+    likewise resolves to :data:`_DEFAULT_CURSOR_MODEL` (the SDK requires a model).
+    The legacy ``auto`` id is remapped to ``auto-smart``.
     """
     if not model or model.startswith(("databricks-", "databricks/")):
         if model:
@@ -114,6 +117,8 @@ def _resolve_model(model: str | None) -> str:
                 model,
                 _DEFAULT_CURSOR_MODEL,
             )
+        return _DEFAULT_CURSOR_MODEL
+    if model == _LEGACY_AUTO_MODEL:
         return _DEFAULT_CURSOR_MODEL
     return model
 
@@ -474,7 +479,8 @@ class CursorExecutor(Executor):
         :param os_env: Optional OS environment / sandbox spec (its ``cwd`` is
             used when *cwd* is unset).
         :param model: Cursor model id (e.g. ``"gpt-5"``); a gateway-routed id
-            or ``None`` falls back to cursor's ``auto`` select.
+            or ``None`` falls back to cursor's ``auto-smart`` select. Legacy
+            ``"auto"`` is remapped to ``auto-smart``.
         :param api_key: Cursor API key. ``None`` falls back to ``CURSOR_API_KEY``
             in the environment.
         :param bundle_dir: Reserved for future skill wiring; unused in v1.
