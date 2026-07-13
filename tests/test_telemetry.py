@@ -145,6 +145,118 @@ def test_is_disabled_none_set(monkeypatch: pytest.MonkeyPatch) -> None:
     assert is_disabled() is False
 
 
+# ── is_disabled — DISABLE_TELEMETRY alias ───────────────────────────────────
+
+
+def test_is_disabled_disable_telemetry(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``DISABLE_TELEMETRY=true`` disables telemetry."""
+    monkeypatch.delenv("OMNIGENT_TELEMETRY", raising=False)
+    monkeypatch.setenv("DISABLE_TELEMETRY", "true")
+    monkeypatch.delenv("CI", raising=False)
+    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    from omnigent.telemetry.client import is_disabled
+
+    assert is_disabled() is True
+
+
+def test_is_disabled_omnigent_disable_telemetry(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``OMNIGENT_DISABLE_TELEMETRY=1`` disables telemetry."""
+    monkeypatch.delenv("OMNIGENT_TELEMETRY", raising=False)
+    monkeypatch.setenv("OMNIGENT_DISABLE_TELEMETRY", "1")
+    monkeypatch.delenv("CI", raising=False)
+    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    from omnigent.telemetry.client import is_disabled
+
+    assert is_disabled() is True
+
+
+# ── is_disabled — config.yaml ────────────────────────────────────────────────
+
+
+_ALL_OPT_OUT_VARS = [
+    "OMNIGENT_TELEMETRY",
+    "DISABLE_TELEMETRY",
+    "OMNIGENT_DISABLE_TELEMETRY",
+    "DO_NOT_TRACK",
+    "CI",
+    "GITHUB_ACTIONS",
+    "PYTEST_CURRENT_TEST",
+    "CIRCLECI",
+    "JENKINS_URL",
+    "TRAVIS",
+    "GITLAB_CI",
+    "TF_BUILD",
+    "BITBUCKET_BUILD_NUMBER",
+    "CODEBUILD_BUILD_ARN",
+    "BUILDKITE",
+    "TEAMCITY_VERSION",
+]
+
+
+def test_is_disabled_config_yaml(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """``telemetry: false`` in config.yaml disables telemetry."""
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text("telemetry: false\n", encoding="utf-8")
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    for var in _ALL_OPT_OUT_VARS:
+        monkeypatch.delenv(var, raising=False)
+    from omnigent.telemetry.client import is_disabled
+
+    assert is_disabled() is True
+
+
+def test_is_disabled_config_yaml_telemetry_true(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``telemetry: true`` in config.yaml does NOT disable telemetry."""
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text("telemetry: true\n", encoding="utf-8")
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    for var in _ALL_OPT_OUT_VARS:
+        monkeypatch.delenv(var, raising=False)
+    from omnigent.telemetry.client import is_disabled
+
+    assert is_disabled() is False
+
+
+# ── init_client — server_config ──────────────────────────────────────────────
+
+
+def test_init_client_server_config_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``init_client(config={'telemetry': False})`` skips client creation."""
+    import omnigent.telemetry.client as _mod
+
+    for var in [
+        "OMNIGENT_TELEMETRY",
+        "DISABLE_TELEMETRY",
+        "OMNIGENT_DISABLE_TELEMETRY",
+        "DO_NOT_TRACK",
+        "CI",
+        "GITHUB_ACTIONS",
+        "PYTEST_CURRENT_TEST",
+        "CIRCLECI",
+        "JENKINS_URL",
+        "TRAVIS",
+        "GITLAB_CI",
+        "TF_BUILD",
+        "BITBUCKET_BUILD_NUMBER",
+        "CODEBUILD_BUILD_ARN",
+        "BUILDKITE",
+        "TEAMCITY_VERSION",
+    ]:
+        monkeypatch.delenv(var, raising=False)
+
+    original_client = _mod._CLIENT
+    try:
+        monkeypatch.setattr(_mod, "_CLIENT", None)
+        _mod.init_client(config={"telemetry": False})
+        assert _mod._CLIENT is None
+    finally:
+        monkeypatch.setattr(_mod, "_CLIENT", original_client)
+
+
 # ── get_installation_id ──────────────────────────────────────────────────────
 
 

@@ -185,7 +185,7 @@ def _config_telemetry_disabled() -> bool:
     silently suppresses telemetry.
     """
     try:
-        import yaml
+        import re as _re
 
         config_home = os.environ.get("OMNIGENT_CONFIG_HOME")
         if config_home:
@@ -194,11 +194,15 @@ def _config_telemetry_disabled() -> bool:
             config_path = Path.home() / ".omnigent" / "config.yaml"
         if not config_path.exists():
             return False
-        with open(config_path) as f:
-            cfg = yaml.safe_load(f) or {}
-        tel = cfg.get("telemetry")
-        # Only `telemetry: false` is supported.
-        return tel is False
+        # Read raw text and match `telemetry: false` directly to avoid
+        # PyYAML SafeLoader bool-resolver corruption: spec/parser.py's
+        # _ConfigYamlLoader subclass modifies the shared
+        # SafeLoader.yaml_implicit_resolvers class dict at import time,
+        # causing `false` to parse as a string rather than a boolean.
+        text = config_path.read_text(encoding="utf-8")
+        return bool(
+            _re.search(r"^\s*telemetry\s*:\s*false\s*$", text, _re.IGNORECASE | _re.MULTILINE)
+        )
     except Exception:
         return False
 
