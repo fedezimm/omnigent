@@ -106,9 +106,6 @@ _CONFIG_FETCH_TIMEOUT_S = 2.0
 _CONFIG_URL_PROD = "https://config.omnigent-telemetry.io"
 _CONFIG_URL_STAGING = "https://config-staging.omnigent-telemetry.io"
 
-# Per-process telemetry session ID — groups all events from one server run.
-_TELEMETRY_SESSION_ID: str = str(uuid.uuid4())
-
 
 @dataclass
 class TelemetryConfig:
@@ -264,6 +261,7 @@ def _build_record(event: object) -> dict[str, Any]:
 
     fields: dict[str, Any] = asdict(event)  # type: ignore[arg-type]
     installation_id: str | None = fields.pop("installation_id", None)
+    session_id: str | None = fields.pop("session_id", None)
 
     # All remaining event-specific fields go into params as a JSON string.
     params_str: str | None = None
@@ -274,7 +272,7 @@ def _build_record(event: object) -> dict[str, Any]:
 
     data: dict[str, Any] = {
         "event_name": type(event).__name__,
-        "session_id": _TELEMETRY_SESSION_ID,
+        "session_id": session_id or "",
         "omnigent_version": VERSION,
         "schema_version": _SCHEMA_VERSION,
         "python_version": sys.version.split()[0],
