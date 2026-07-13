@@ -379,10 +379,15 @@ class SessionResourceRegistry:
         is awaited so the ``session.resource.deleted`` publish (and the harness
         release it spawns) is observable without polling. Intended for tests
         that need to synchronize on the fan-out deterministically.
+
+        Single-shot: the "scheduled" event is never cleared, so a second call
+        returns immediately. Use it to synchronize on one terminal exit, not a
+        sequence of them.
         """
         await self._terminal_exit_scheduled.wait()
-        for task in list(self._terminal_exit_tasks):
-            await task
+        tasks = list(self._terminal_exit_tasks)
+        if tasks:
+            await asyncio.gather(*tasks)
 
     def _set_session_status_memo(self, session_id: str, status: str) -> None:
         """Record the session's latest PTY status for exit classification."""
