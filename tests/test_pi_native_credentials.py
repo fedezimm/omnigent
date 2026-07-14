@@ -847,7 +847,7 @@ def test_databricks_profile_registers_gpt_provider(monkeypatch: pytest.MonkeyPat
     )
     live_gpt = [{"id": "databricks-gpt-5-4", "input": ["text", "image"]}]
     live_claude = [{"id": "databricks-claude-sonnet-4-6", "input": ["text", "image"]}]
-    monkeypatch.setattr(creds, "_fetch_pi_model_lists", lambda *_: (live_claude, live_gpt, []))
+    monkeypatch.setattr(creds, "_fetch_pi_model_lists", lambda *_: (live_claude, live_gpt))
 
     provider = creds.resolve_pi_native_provider(config_loader=_databricks_config)
     assert provider is not None
@@ -875,7 +875,7 @@ def test_cli_config_databricks_registers_gpt_provider(
     live_gpt = [{"id": "databricks-gpt-5-4", "input": ["text", "image"]}]
     live_claude = [{"id": "databricks-claude-sonnet-4-6", "input": ["text", "image"]}]
     monkeypatch.setattr(creds, "_run_auth_command", lambda *_: "fake-token")
-    monkeypatch.setattr(creds, "_fetch_pi_model_lists", lambda *_: (live_claude, live_gpt, []))
+    monkeypatch.setattr(creds, "_fetch_pi_model_lists", lambda *_: (live_claude, live_gpt))
 
     provider = creds.resolve_pi_native_provider(config_loader=_cli_config_databricks_config)
     assert provider is not None
@@ -893,7 +893,7 @@ def test_cli_config_databricks_registers_gpt_provider(
 
 
 def test_fetch_pi_model_lists_parses_serving_endpoints() -> None:
-    """_fetch_pi_model_lists splits live endpoints by family into Pi model dicts."""
+    """_fetch_pi_model_lists splits live endpoints into claude/openai lists."""
     import json
     import unittest.mock
 
@@ -913,6 +913,14 @@ def test_fetch_pi_model_lists_parses_serving_endpoints() -> None:
             },
             {"name": "databricks-gpt-5-4", "task": "llm/v1/chat", "state": {"ready": "READY"}},
             {"name": "databricks-llama-3-70b", "task": "llm/v1/chat", "state": {"ready": "READY"}},
+            # GLM endpoint — task-based detection (no name token needed)
+            {
+                "name": "databricks-zai-org-glm-4-7",
+                "task": "llm/v1/chat",
+                "state": {"ready": "READY"},
+            },
+            # GLM without task field — falls back to name token "glm"
+            {"name": "databricks-glm-4-7", "state": {"ready": "READY"}},
             {"name": "my-embedding-model", "task": "llm/v1/embeddings"},
             {"name": "databricks-gpt-5-5", "task": "llm/v1/chat", "state": {"ready": "NOT_READY"}},
         ]
@@ -929,15 +937,22 @@ def test_fetch_pi_model_lists_parses_serving_endpoints() -> None:
         "httpx.Client",
         lambda **kw: _real_client(transport=_MockTransport()),
     ):
-        claude, gpt, other = creds._fetch_pi_model_lists("https://wkspc.example.com", "tok")
+        claude, openai = creds._fetch_pi_model_lists("https://wkspc.example.com", "tok")
 
     assert [m["id"] for m in claude] == [
         "databricks-claude-sonnet-4-6",
         "databricks-claude-opus-4-8",
     ]
-    assert [m["id"] for m in gpt] == ["databricks-gpt-5-4"]
-    assert [m["id"] for m in other] == ["databricks-llama-3-70b"]
-    assert all(m.get("input") == ["text", "image"] for m in claude + gpt + other)
+    # GPT, Llama, and GLM (both task-detected and name-detected) all go to openai
+    openai_ids = [m["id"] for m in openai]
+    assert "databricks-gpt-5-4" in openai_ids
+    assert "databricks-llama-3-70b" in openai_ids
+    assert "databricks-zai-org-glm-4-7" in openai_ids
+    assert "databricks-glm-4-7" in openai_ids
+    # Embeddings and not-ready endpoints excluded
+    assert "my-embedding-model" not in openai_ids
+    assert "databricks-gpt-5-5" not in openai_ids
+    assert all(m.get("input") == ["text", "image"] for m in claude + openai)
 
 
 def test_fetch_pi_model_lists_falls_back_on_http_error() -> None:
@@ -959,8 +974,7 @@ def test_fetch_pi_model_lists_falls_back_on_http_error() -> None:
         "httpx.Client",
         lambda **kw: _real_client(transport=_ErrorTransport()),
     ):
-        claude, gpt, other = creds._fetch_pi_model_lists("https://wkspc.example.com", "bad-tok")
+        claude, openai = creds._fetch_pi_model_lists("https://wkspc.example.com", "bad-tok")
 
     assert claude == []
-    assert gpt == []
-    assert other == []
+    assert openai == []

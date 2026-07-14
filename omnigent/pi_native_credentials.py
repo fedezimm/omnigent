@@ -208,13 +208,13 @@ def _databricks_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
         from omnigent.runtime.credentials.databricks import resolve_databricks_workspace
 
         creds = resolve_databricks_workspace(entry.profile)
-        claude_models, gpt_models, _ = _fetch_pi_model_lists(creds.host, creds.token)
+        claude_models, openai_models = _fetch_pi_model_lists(creds.host, creds.token)
     except Exception:  # noqa: BLE001 — credential/network failure must not break launch
         _LOGGER.info(
             "pi-native: falling back to single-model display (could not resolve credentials)"
         )
         claude_models = []
-        gpt_models = []
+        openai_models = []
     return PiProviderConfig(
         provider_id=_PI_PROVIDER_ID,
         base_url=f"{host}{_DATABRICKS_ANTHROPIC_GATEWAY_PATH}",
@@ -229,10 +229,10 @@ def _databricks_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
         additional_providers=(
             {
                 _PI_OPENAI_PROVIDER_ID: _databricks_openai_provider(
-                    api_key, f"{host}/serving-endpoints", gpt_models
+                    api_key, f"{host}/serving-endpoints", openai_models
                 )
             }
-            if gpt_models
+            if openai_models
             else {}
         ),
     )
@@ -320,20 +320,25 @@ def _run_auth_command(auth_command: str, *, timeout: float = 15.0) -> str | None
 def _fetch_pi_model_lists(
     workspace_url: str,
     token: str,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Fetch live model lists from the Databricks serving-endpoints API.
 
-    Calls ``GET <workspace>/api/2.0/serving-endpoints``, filters for
-    READY LLM endpoints, and splits them by family (Claude/GPT/other) into
-    Pi model entry dicts (``{"id": name, "input": ["text", "image"]}``).
-    Falls back to the bundled static lists on any HTTP or auth failure so a
-    network blip or credential gap never breaks Pi session launch.
+    Calls ``GET <workspace>/api/2.0/serving-endpoints``, filters for READY LLM
+    endpoints, and splits them into two Pi model entry dict lists:
+
+    * Claude models → ``anthropic-messages`` provider.
+    * All other LLMs (GPT, GLM, Llama, Qwen, Kimi, …) → ``openai-completions``
+      provider. All non-Claude Databricks LLMs share the same serving-endpoints
+      URL and wire protocol, so a single provider covers them all.
+
+    Falls back to empty lists on any HTTP or auth failure so a network blip
+    never breaks Pi session launch.
 
     :param workspace_url: Databricks workspace base URL, e.g.
         ``"https://wkspc.example.com"`` — **no** trailing slash or path.
     :param token: Bearer token for the workspace API.
-    :returns: ``(claude_models, gpt_models, other_models)`` — each a list
-        of Pi model entry dicts ready to write into ``models.json``.
+    :returns: ``(claude_models, openai_models)`` — Pi model entry dicts ready
+        to write into ``models.json``.
     """
     import httpx
 
@@ -351,12 +356,14 @@ def _fetch_pi_model_lists(
             "Pi will show only the selected model",
             exc_info=True,
         )
-        return [], [], []
+        return [], []
 
     endpoints = payload.get("endpoints") if isinstance(payload, dict) else None
     claude: list[dict[str, Any]] = []
-    gpt: list[dict[str, Any]] = []
-    other: list[dict[str, Any]] = []
+    # All non-Claude LLM models (GPT, GLM, Llama, Qwen, Kimi, …) route to the
+    # same OpenAI Completions provider and serving-endpoints URL, so they share
+    # one list regardless of model family.
+    openai: list[dict[str, Any]] = []
 
     for endpoint in endpoints if isinstance(endpoints, list) else []:
         if not isinstance(endpoint, dict):
@@ -373,7 +380,7 @@ def _fetch_pi_model_lists(
         else:
             is_llm = any(
                 t in name_lower
-                for t in ("claude", "gpt", "codex", "gemini", "llama", "qwen", "kimi")
+                for t in ("claude", "gpt", "codex", "gemini", "llama", "qwen", "kimi", "glm")
             )
         if not is_llm:
             continue
@@ -384,18 +391,16 @@ def _fetch_pi_model_lists(
         entry: dict[str, Any] = {"id": name, "input": ["text", "image"]}
         if "claude" in name_lower:
             claude.append(entry)
-        elif "gpt" in name_lower:
-            gpt.append(entry)
         else:
-            other.append(entry)
+            openai.append(entry)
 
-    if not claude and not gpt and not other:
+    if not claude and not openai:
         _LOGGER.info(
             "pi-native: Databricks serving-endpoints returned no LLM models; "
             "Pi will show only the selected model"
         )
 
-    return claude, gpt, other
+    return claude, openai
 
 
 def _gateway_anthropic_base_url(codex_base_url: str) -> str:
@@ -534,19 +539,18 @@ def _cli_config_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
     # Fetch the live model list. Run the auth command once to get the current
     # token — Pi will refresh per request via the !command apiKey.
     claude_models: list[dict[str, Any]] = []
-    gpt_models: list[dict[str, Any]] = []
+    openai_models: list[dict[str, Any]] = []
     if workspace_url and transport.auth_command:
         token = _run_auth_command(transport.auth_command)
         if token:
-            live_claude, live_gpt, _ = _fetch_pi_model_lists(workspace_url, token)
-            claude_models, gpt_models = live_claude, live_gpt
+            claude_models, openai_models = _fetch_pi_model_lists(workspace_url, token)
     additional: dict[str, Any] = (
         {
             _PI_OPENAI_PROVIDER_ID: _databricks_openai_provider(
-                api_key, f"{workspace_url}/serving-endpoints", gpt_models
+                api_key, f"{workspace_url}/serving-endpoints", openai_models
             )
         }
-        if workspace_url and gpt_models
+        if workspace_url and openai_models
         else {}
     )
     return PiProviderConfig(
