@@ -9,7 +9,9 @@ tunnel.
 
 from __future__ import annotations
 
+import logging
 import threading
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -25,6 +27,19 @@ from omnigent.spec import AgentSpec
 if TYPE_CHECKING:
     from omnigent.runner.transports.ws_tunnel.registry import RunnerSession, TunnelRegistry
     from omnigent.stores import ConversationStore
+
+_logger = logging.getLogger(__name__)
+
+# Circuit breaker: open after this many consecutive transport failures.
+_CB_FAILURE_THRESHOLD = 3
+# Seconds to keep the circuit open before allowing one half-open probe.
+_CB_OPEN_SECONDS = 60.0
+
+
+@dataclass
+class _CircuitState:
+    failures: int = 0
+    opened_at: float | None = None
 
 
 _EXECUTOR_TYPE_TO_HARNESS: dict[str, str] = {"claude_sdk": "claude-sdk"}
@@ -85,6 +100,7 @@ class RunnerRouter:
         self._conversation_store = conversation_store
         self._clients: dict[str, httpx.AsyncClient] = {}
         self._lock = threading.RLock()
+        self._circuit_states: dict[str, _CircuitState] = {}
 
     def client_for_conversation(self, *, conversation_id: str, harness: str) -> RoutedRunner:
         """
@@ -140,6 +156,7 @@ class RunnerRouter:
                     f"runner {conv.runner_id!r} is offline for conversation {conversation_id!r}",
                     code=ErrorCode.RUNNER_UNAVAILABLE,
                 )
+            self._check_circuit(conv.runner_id)
             return RoutedRunner(
                 runner_id=conv.runner_id,
                 client=self._client_for_runner(conv.runner_id),
@@ -176,10 +193,48 @@ class RunnerRouter:
                 f"runner {conv.runner_id!r} is offline for conversation {conversation_id!r}",
                 code=ErrorCode.RUNNER_UNAVAILABLE,
             )
+        self._check_circuit(conv.runner_id)
         return RoutedRunner(
             runner_id=conv.runner_id,
             client=self._client_for_runner(conv.runner_id),
         )
+
+    def record_runner_failure(self, runner_id: str) -> None:
+        """
+        Record a transport failure for *runner_id*.
+
+        After :data:`_CB_FAILURE_THRESHOLD` consecutive failures the
+        circuit opens and subsequent calls to routing methods raise
+        :exc:`~omnigent.errors.OmnigentError` immediately instead of
+        attempting a connection.
+
+        :param runner_id: Runner UUID, e.g.
+            ``"runner_0123456789abcdef"``.
+        """
+        if not runner_id:
+            return
+        with self._lock:
+            state = self._circuit_states.setdefault(runner_id, _CircuitState())
+            state.failures += 1
+            if state.failures >= _CB_FAILURE_THRESHOLD and state.opened_at is None:
+                state.opened_at = time.monotonic()
+                _logger.warning(
+                    "circuit breaker opened for runner %r after %d consecutive failures",
+                    runner_id,
+                    state.failures,
+                )
+
+    def record_runner_success(self, runner_id: str) -> None:
+        """
+        Reset the failure counter for *runner_id* after a successful call.
+
+        :param runner_id: Runner UUID, e.g.
+            ``"runner_0123456789abcdef"``.
+        """
+        if not runner_id:
+            return
+        with self._lock:
+            self._circuit_states.pop(runner_id, None)
 
     def runner_is_online(self, runner_id: str) -> bool:
         """
@@ -217,6 +272,31 @@ class RunnerRouter:
         for client in clients:
             await client.aclose()
 
+    def _check_circuit(self, runner_id: str) -> None:
+        """
+        Raise if the circuit for *runner_id* is open.
+
+        In the half-open window (after :data:`_CB_OPEN_SECONDS` have
+        elapsed) the state is cleared so the next call acts as a probe.
+
+        :param runner_id: Runner UUID.
+        :raises OmnigentError: When the circuit is open.
+        """
+        with self._lock:
+            state = self._circuit_states.get(runner_id)
+            if state is None or state.opened_at is None:
+                return
+            elapsed = time.monotonic() - state.opened_at
+            if elapsed < _CB_OPEN_SECONDS:
+                raise OmnigentError(
+                    f"runner {runner_id!r} circuit is open "
+                    f"({state.failures} consecutive failures); try again shortly",
+                    code=ErrorCode.RUNNER_UNAVAILABLE,
+                )
+            # Half-open: clear state and allow one probe through.
+            _logger.info("circuit breaker half-open for runner %r; allowing probe", runner_id)
+            self._circuit_states.pop(runner_id)
+
     def _routed_pinned_runner(self, runner_id: str, *, harness: str) -> RoutedRunner:
         """
         Return a routed runner after validating hard affinity.
@@ -238,6 +318,7 @@ class RunnerRouter:
                 f"runner {runner_id!r} does not support harness {harness!r}",
                 code=ErrorCode.RUNNER_CAPABILITY_MISMATCH,
             )
+        self._check_circuit(runner_id)
         return RoutedRunner(runner_id=runner_id, client=self._client_for_runner(runner_id))
 
     def _client_for_runner(self, runner_id: str) -> httpx.AsyncClient:
@@ -255,7 +336,7 @@ class RunnerRouter:
                 client = httpx.AsyncClient(
                     transport=WSTunnelTransport(self._registry, runner_id),
                     base_url="http://runner",
-                    timeout=httpx.Timeout(5.0, read=None),
+                    timeout=httpx.Timeout(3.0, read=None),
                 )
                 # The global httpx instrumentation can't see this client's
                 # custom WSTunnelTransport, so instrument the instance

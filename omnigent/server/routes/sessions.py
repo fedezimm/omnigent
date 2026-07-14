@@ -117,7 +117,7 @@ from omnigent.runner.identity import (
     RUNNER_TUNNEL_TOKEN_HEADER,
     token_bound_runner_id,
 )
-from omnigent.runner.routing import RunnerRouter
+from omnigent.runner.routing import RoutedRunner, RunnerRouter
 from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
 from omnigent.runtime import (
     get_agent_cache,
@@ -7102,23 +7102,39 @@ async def _ensure_runner_session_initialized(
         )
 
 
+def _report_runner_transport_failure(runner_id: str) -> None:
+    """Notify the runner router of a transport failure for circuit-breaker tracking."""
+    from omnigent.runtime import get_runner_router
+
+    router = get_runner_router()
+    if router is not None:
+        router.record_runner_failure(runner_id)
+
+
 async def _get_runner_client_for_resource_access(
     session_id: str,
-) -> httpx.AsyncClient | None:
-    """Return the authoritative runner client for session resources.
+) -> RoutedRunner | None:
+    """Return the authoritative routed runner for session resources.
 
     Requires the session to be bound to a runner via
     ``PATCH /v1/sessions/{id}``; raises ``conflict`` otherwise. If no
     runner router is configured (unit-test/in-process setups), callers
     may fall back to local registries.
+
+    Returns a :class:`~omnigent.runner.routing.RoutedRunner` so callers
+    can report transport failures back to the circuit breaker via
+    :meth:`~omnigent.runner.routing.RunnerRouter.record_runner_failure`.
+    In the legacy in-process path ``runner_id`` is ``""``.
     """
     from omnigent.runtime import get_runner_client, get_runner_router
 
     runner_router = get_runner_router()
     if runner_router is not None:
-        routed_runner = runner_router.client_for_session_resources(session_id)
-        return routed_runner.client
-    return cast("httpx.AsyncClient | None", get_runner_client())
+        return runner_router.client_for_session_resources(session_id)
+    legacy_client = cast("httpx.AsyncClient | None", get_runner_client())
+    if legacy_client is None:
+        return None
+    return RoutedRunner(runner_id="", client=legacy_client)
 
 
 async def _proxy_get_session_resources_to_runner(
@@ -7141,7 +7157,7 @@ async def _proxy_get_session_resources_to_runner(
             f"/v1/sessions/{session_id}/resources",
             # Runner-side list_session_resources applies the type filter.
             params={"type": resource_type} if resource_type else None,
-            timeout=10.0,
+            timeout=3.0,
         )
         if resp.status_code != 200:
             _logger.warning(
@@ -7227,12 +7243,12 @@ async def _reset_runner_resources_after_switch(session_id: str) -> None:
     :returns: None.
     """
     try:
-        runner_client = await _get_runner_client_for_resource_access(session_id)
-        if runner_client is None:
+        routed = await _get_runner_client_for_resource_access(session_id)
+        if routed is None:
             return
-        reset_resp = await runner_client.post(
+        reset_resp = await routed.client.post(
             f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}/reset-state",
-            timeout=15.0,
+            timeout=3.0,
         )
         # httpx only raises on transport errors — a 4xx/5xx reset response
         # still returns. A non-2xx means the runner did NOT close the old
@@ -17321,10 +17337,10 @@ def create_sessions_router(
                     "Session not found",
                     code=ErrorCode.NOT_FOUND,
                 )
-        runner_client = await _get_runner_client_for_resource_access(session_id)
-        if runner_client is not None:
+        routed = await _get_runner_client_for_resource_access(session_id)
+        if routed is not None:
             page = await _proxy_get_session_resources_to_runner(
-                runner_client, session_id, resource_type=type
+                routed.client, session_id, resource_type=type
             )
         else:
             from omnigent.entities.session_resources import (
@@ -17432,17 +17448,18 @@ def create_sessions_router(
         :returns: Parsed JSON response body.
         :raises HTTPException: 502 on runner failure.
         """
-        runner_client = await _get_runner_client_for_resource_access(
+        routed = await _get_runner_client_for_resource_access(
             session_id,
         )
-        if runner_client is None:
+        if routed is None:
             raise HTTPException(
                 status_code=502,
                 detail="no runner available for resource access",
             )
         try:
-            resp = await runner_client.get(path, params=params, timeout=10.0)
+            resp = await routed.client.get(path, params=params, timeout=3.0)
         except (httpx.HTTPError, ConnectionError) as exc:
+            _report_runner_transport_failure(routed.runner_id)
             raise HTTPException(
                 status_code=502,
                 detail="runner resource endpoint unavailable",
@@ -17475,21 +17492,22 @@ def create_sessions_router(
         :returns: Tuple of (status_code, parsed_json_body).
         :raises HTTPException: 502 on transport failure.
         """
-        runner_client = await _get_runner_client_for_resource_access(
+        routed = await _get_runner_client_for_resource_access(
             session_id,
         )
-        if runner_client is None:
+        if routed is None:
             raise HTTPException(
                 status_code=502,
                 detail="no runner available for resource access",
             )
         try:
-            resp = await runner_client.post(
+            resp = await routed.client.post(
                 path,
                 json=body,
-                timeout=10.0,
+                timeout=3.0,
             )
         except (httpx.HTTPError, ConnectionError) as exc:
+            _report_runner_transport_failure(routed.runner_id)
             raise HTTPException(
                 status_code=502,
                 detail="runner resource endpoint unavailable",
@@ -17507,17 +17525,18 @@ def create_sessions_router(
         :returns: Tuple of (status_code, parsed_json_body).
         :raises HTTPException: 502 on transport failure.
         """
-        runner_client = await _get_runner_client_for_resource_access(
+        routed = await _get_runner_client_for_resource_access(
             session_id,
         )
-        if runner_client is None:
+        if routed is None:
             raise HTTPException(
                 status_code=502,
                 detail="no runner available for resource access",
             )
         try:
-            resp = await runner_client.delete(path, timeout=10.0)
+            resp = await routed.client.delete(path, timeout=3.0)
         except (httpx.HTTPError, ConnectionError) as exc:
+            _report_runner_transport_failure(routed.runner_id)
             raise HTTPException(
                 status_code=502,
                 detail="runner resource endpoint unavailable",
@@ -17537,21 +17556,22 @@ def create_sessions_router(
         :returns: Tuple of (status_code, parsed_json_body).
         :raises HTTPException: 502 on transport failure.
         """
-        runner_client = await _get_runner_client_for_resource_access(
+        routed = await _get_runner_client_for_resource_access(
             session_id,
         )
-        if runner_client is None:
+        if routed is None:
             raise HTTPException(
                 status_code=502,
                 detail="no runner available for resource access",
             )
         try:
-            resp = await runner_client.put(
+            resp = await routed.client.put(
                 path,
                 json=body,
-                timeout=10.0,
+                timeout=3.0,
             )
         except (httpx.HTTPError, ConnectionError) as exc:
+            _report_runner_transport_failure(routed.runner_id)
             raise HTTPException(
                 status_code=502,
                 detail="runner resource endpoint unavailable",
@@ -17571,21 +17591,22 @@ def create_sessions_router(
         :returns: Tuple of (status_code, parsed_json_body).
         :raises HTTPException: 502 on transport failure.
         """
-        runner_client = await _get_runner_client_for_resource_access(
+        routed = await _get_runner_client_for_resource_access(
             session_id,
         )
-        if runner_client is None:
+        if routed is None:
             raise HTTPException(
                 status_code=502,
                 detail="no runner available for resource access",
             )
         try:
-            resp = await runner_client.patch(
+            resp = await routed.client.patch(
                 path,
                 json=body,
-                timeout=10.0,
+                timeout=3.0,
             )
         except (httpx.HTTPError, ConnectionError) as exc:
+            _report_runner_transport_failure(routed.runner_id)
             raise HTTPException(
                 status_code=502,
                 detail="runner resource endpoint unavailable",
@@ -20367,20 +20388,20 @@ def create_sessions_router(
         # deletable. Server-owned records (files and conversation row
         # below) live independently of the runner, and runner-side
         # resources are gone with the runner anyway.
-        runner_client: httpx.AsyncClient | None = None
+        routed: RoutedRunner | None = None
         try:
-            runner_client = await _get_runner_client_for_resource_access(session_id)
+            routed = await _get_runner_client_for_resource_access(session_id)
         except OmnigentError as exc:
             _logger.info(
                 "Skipping runner-side cleanup for %s; proceeding with server-side delete: %s",
                 session_id,
                 exc,
             )
-        if runner_client is not None:
+        if routed is not None:
             try:
-                await runner_client.delete(
+                await routed.client.delete(
                     f"/v1/sessions/{session_id}/resources",
-                    timeout=10.0,
+                    timeout=3.0,
                 )
             except (httpx.HTTPError, ConnectionError):
                 _logger.warning(
