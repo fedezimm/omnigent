@@ -1615,7 +1615,14 @@ class PiExecutor(Executor):
         # off (they don't route through Omnigent policies / history and
         # can 400 against the Databricks Responses API), and the bridge
         # extension's tools are explicitly allowlisted.
-        self._extra_args: list[str] = ["--no-tools"]
+        self._extra_args: list[str] = [
+            "--no-tools",
+            # Pre-accept the project-folder trust dialog. Pi 0.80+ shows a
+            # blocking TUI prompt on first launch in a directory with .pi/
+            # resources. In a runner-driven session there is nobody at the
+            # terminal to answer it, so we approve unconditionally.
+            "--approve",
+        ]
         self._bundle_dir = bundle_dir
         self._agent_name = agent_name
         self._skills_filter = skills_filter

@@ -1718,7 +1718,16 @@ def _build_pi_native_args(
     :returns: Complete Pi arg vector excluding the executable.
     """
     user_args = list(terminal_launch_args or [])
-    args = ["--extension", str(extension_path)]
+    args = [
+        "--extension",
+        str(extension_path),
+        # Pre-accept the project-folder trust dialog. Pi 0.80+ shows a blocking
+        # TUI prompt ("Trust project folder?") on first launch in a directory
+        # that has .pi/ resources. In a web-UI-driven native session there is
+        # nobody at the terminal to answer it, so we approve unconditionally —
+        # mirroring how ensure_claude_workspace_trusted handles Claude's dialog.
+        "--approve",
+    ]
     if not _pi_args_have_session_control(user_args):
         args.extend(["--session-dir", str(session_dir)])
         if external_session_id:
