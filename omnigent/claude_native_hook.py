@@ -49,8 +49,8 @@ from omnigent.native_policy_hook import (
 # NOTE: this bounds a SINGLE long-poll, NOT the retry loop. Re-POST
 # attempts after a *failure* are bounded separately by
 # ``_PERMISSION_MAX_CONSECUTIVE_FAILURES`` — see :func:`_post_hook_with_reattach`.
-# 30-second circuit breaker: if no verdict arrives the server returns
-# an explicit deny, so the hook subprocess relays that deny decision.
+# 30-second circuit breaker: if no verdict arrives the hook exits with
+# empty output so Claude falls back to its TUI prompt (fail-ask).
 _PERMISSION_TIMEOUT_S = 30.0
 # First retry must land inside the server's re-park grace (proxies
 # sever idle long-polls); later retries back off.

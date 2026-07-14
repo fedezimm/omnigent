@@ -1237,9 +1237,9 @@ def build_hook_settings(
             "type": "command",
             "command": shlex.join(permission_command_parts),
             # 30-second circuit breaker: if no web verdict arrives the
-            # server returns an explicit deny, failing the tool call.
-            # Kept in lockstep with the subprocess/AP-side budgets so
-            # no single layer caps the wait first.
+            # hook exits with empty output so Claude falls back to its
+            # TUI prompt (fail-ask). Kept in lockstep with the
+            # subprocess/AP-side budgets so no single layer caps first.
             "timeout": 30,
         }
         hooks["PermissionRequest"] = [{"hooks": [permission_hook]}]

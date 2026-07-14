@@ -610,11 +610,11 @@ _RUNNER_CONVICTION_POLL_S = 0.25
 # behavior rather than blocking the turn.
 _HOST_LAUNCH_RESULT_TIMEOUT_S = 10.0
 # Server-side wait budget for Claude's ``PermissionRequest`` hook.
-# 30-second circuit breaker: if the web UI doesn't deliver a verdict
-# within 30s the server returns an explicit ``"deny"`` decision and
-# the tool call fails. Kept in lockstep with the hook subprocess
-# httpx budget (``_PERMISSION_TIMEOUT_S`` in ``claude_native_hook``)
-# and Claude Code's own command-hook ``timeout`` (set in
+# 30-second circuit breaker: if no verdict arrives within 30s the
+# server returns an empty 2xx and Claude defers to its built-in TUI
+# prompt (fail-ask). Kept in lockstep with the hook subprocess httpx
+# budget (``_PERMISSION_TIMEOUT_S`` in ``claude_native_hook``) and
+# Claude Code's own command-hook ``timeout`` (set in
 # ``build_hook_settings``) so no single layer caps the wait first.
 _CLAUDE_NATIVE_PERMISSION_HOOK_TIMEOUT_S = 30.0
 
@@ -16136,8 +16136,8 @@ def create_sessions_router(
         Response shape follows Claude Code's PermissionRequest hook
         contract: ``hookSpecificOutput.decision.behavior`` is
         ``"allow"`` or ``"deny"``. On timeout the endpoint returns
-        ``200`` with an explicit ``"deny"`` decision — the tool call
-        fails rather than deferring to the TUI (circuit breaker).
+        ``200`` with an empty body — Claude Code treats that as
+        "defer to the TUI prompt" (fail-ask).
 
         Auth: standard session ACL — the wrapper's outbound headers
         (``ap_auth_headers`` in :func:`build_hook_settings`) carry
@@ -16148,9 +16148,8 @@ def create_sessions_router(
         :param request: FastAPI request — body is Claude Code's
             PermissionRequest payload as JSON.
         :param session_id: Omnigent conversation id from the URL path.
-        :returns: Claude PermissionRequest hookSpecificOutput JSON
-            with ``"allow"`` or ``"deny"``; on timeout returns
-            ``"deny"`` (circuit breaker).
+        :returns: Claude PermissionRequest hookSpecificOutput JSON,
+            or ``200`` with empty body on timeout (fail-ask).
         :raises OmnigentError: 404 if the session doesn't exist,
             400 if the body fails JSON parse or is missing
             ``tool_name``.
@@ -16298,18 +16297,9 @@ def create_sessions_router(
             tool_input=tool_input if isinstance(tool_input, dict) else None,
         )
         if result is None:
-            # Timeout or disconnect — circuit breaker: explicitly deny
-            # so the tool call fails rather than deferring to the TUI.
-            deny_body = {
-                "hookSpecificOutput": {
-                    "hookEventName": "PermissionRequest",
-                    "decision": {"behavior": "deny"},
-                },
-            }
-            return Response(
-                content=json.dumps(deny_body),
-                media_type="application/json",
-            )
+            # Timeout or disconnect — empty 2xx → Claude defers to its
+            # built-in TUI prompt (fail-ask).
+            return Response(status_code=status.HTTP_200_OK)
 
         behavior = "allow" if result.action == "accept" else "deny"
         decision: dict[str, Any] = {"behavior": behavior}
