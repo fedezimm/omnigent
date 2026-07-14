@@ -415,8 +415,9 @@ class SqlConversationMetadata(OmnigentBase):
             "host_id IS NULL OR workspace IS NOT NULL",
             name="ck_conversation_metadata_workspace_required_for_host",
         ),
-        # Supports list_conversations kind filter.
-        Index("ix_conversation_metadata_kind", "workspace_id", "kind", "id"),
+        # Covers list_conversations kind+archived filter — avoids heap fetches when both
+        # columns are filtered together (e.g. kind=sub_agent AND archived=false).
+        Index("ix_conversation_metadata_kind", "workspace_id", "kind", "archived", "id"),
         # Supports list_conversations_by_runner_id and get_runner_ids.
         Index("ix_conversation_metadata_runner_id", "workspace_id", "runner_id", "id"),
     )
