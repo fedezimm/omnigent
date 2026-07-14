@@ -63,10 +63,14 @@ def test_classify_surface_regular_browser() -> None:
 # ── is_disabled ─────────────────────────────────────────────────────────────
 
 
-def _import_is_disabled():
-    from omnigent.telemetry.client import is_disabled
+@pytest.fixture(autouse=True)
+def _reset_is_disabled_cache():
+    """Reset the is_disabled() cache before each test so env patches take effect."""
+    import omnigent.telemetry.client as _mod
 
-    return is_disabled
+    _mod._IS_DISABLED_CACHE[0] = None
+    yield
+    _mod._IS_DISABLED_CACHE[0] = None
 
 
 def test_is_disabled_omnigent_telemetry_zero(monkeypatch: pytest.MonkeyPatch) -> None:
